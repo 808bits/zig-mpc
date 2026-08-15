@@ -1,0 +1,153 @@
+# Tag-driven release: `git tag v0.0.1 && git push origin v0.0.1` builds every
+# target and publishes them. Zig cross-compiles all six from one Linux runner,
+# so there is no build matrix and no macOS or Windows runner to pay for.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (no leading v), for a dry run without a tag"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  # Pinned so releases are reproducible: the same source and the same compiler
+  # give byte-identical binaries. Bump deliberately, never float this.
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Resolve version
+        id: v
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version='${{ inputs.version }}'
+          else
+            version='${{ github.ref_name }}'
+            version="${version#v}"
+          fi
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::version '$version' is not X.Y.Z" >&2; exit 1 ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # Gate the release on the tests: a tag that fails here publishes nothing.
+      - run: zig build test
+
+      - name: Build every target
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          # The binaries are already bit-reproducible; the archives are not
+          # unless every timestamp, owner and name order is pinned. gzip stamps
+          # the time into its header (-n), tar stores mtime and ownership, and
+          # zip stores a DOS local-time mtime (so TZ has to be fixed too). The
+          # tagged commit's date is the epoch, so a rebuilder needs only the tag.
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH TZ=UTC
+
+          # No libc is linked, so std reaches the kernel through raw syscalls
+          # and the binaries come out static on any Linux ABI: -gnu, -musl and
+          # a bare -linux all produce the same bytes. The ABI is left off
+          # rather than claiming a musl build that is not one. The static
+          # property is asserted below instead of being assumed.
+          for target in \
+            x86_64-linux aarch64-linux \
+            x86_64-macos aarch64-macos \
+            x86_64-windows aarch64-windows
+          do
+            echo "==> $target"
+            zig build \
+              -Doptimize=ReleaseSafe \
+              -Dstrip=true \
+              -Dversion="$VERSION" \
+              -Dtarget="$target" \
+              --prefix "out/$target"
+
+            name="zmpc-v${VERSION}-${target}"
+            case "$target" in
+              *windows*)
+                cp "out/$target/bin/zmpc.exe" "$name.exe"
+                chmod 755 "$name.exe"
+                touch -d "@$SOURCE_DATE_EPOCH" "$name.exe"
+                zip -qX "dist/$name.zip" "$name.exe"
+                rm "$name.exe"
+                ;;
+              *)
+                cp "out/$target/bin/zmpc" "$name"
+                chmod 755 "$name"
+                touch -d "@$SOURCE_DATE_EPOCH" "$name"
+                tar --sort=name --owner=0 --group=0 --numeric-owner \
+                    --mtime="@$SOURCE_DATE_EPOCH" -cf - "$name" \
+                  | gzip -9n > "dist/$name.tar.gz"
+                rm "$name"
+                ;;
+            esac
+          done
+          cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      # The Linux build runs on the runner's own architecture, so its known
+      # answer tests are a real check that what we ship actually works.
+      - name: Smoke-test the shipped Linux binary
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          bin="out/x86_64-linux/bin/zmpc"
+          test "$($bin version)" = "zmpc ${VERSION}"
+          $bin selftest
+
+      # Nothing links libc today, so both Linux binaries are static. Linking
+      # it later (a C dependency, an explicit linkLibC) would silently make
+      # them dynamic and give them a glibc floor, which is exactly the kind of
+      # regression nobody notices until a user on another distro reports it.
+      # A dynamic executable carries a PT_INTERP segment naming its loader.
+      - name: Assert the Linux binaries are static
+        run: |
+          set -euo pipefail
+          for target in x86_64-linux aarch64-linux; do
+            bin="out/$target/bin/zmpc"
+            if readelf -lW "$bin" | grep -q INTERP; then
+              echo "::error::$target is dynamically linked: $(readelf -lW "$bin" | grep INTERP)"
+              exit 1
+            fi
+            echo "$target: static"
+          done
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "dry run: built $(ls dist | wc -l) artifacts, not publishing"
+            exit 0
+          fi
+          gh release create "${{ github.ref_name }}" \
+            --title "v${VERSION}" \
+            --generate-notes \
+            --notes "Static \`ReleaseSafe\` builds. Verify with \`sha256sum -c SHA256SUMS\`." \
+            dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zmpc-v${{ steps.v.outputs.version }}
+          path: dist/

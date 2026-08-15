@@ -1,0 +1,14 @@
+.zig-cache/
+zig-out/
+
+# Autodoc from `zig build-lib -femit-docs`. Mostly a sources.tar that
+# duplicates the tree it was generated from, so committing it would put a
+# second copy of the repo in the repo.
+docs/
+
+# Static libraries from running `zig build-lib` directly (libroot.a,
+# libbuild.a). The real build output goes to zig-out/.
+*.a
+
+# Default spool for `zmpc relay`, if it is run from the repo root.
+zmpc-spool/
