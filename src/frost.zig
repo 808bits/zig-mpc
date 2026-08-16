@@ -340,6 +340,20 @@ pub fn Frost(comptime Suite: type) type {
             commitment_list: []const Commitment,
         ) !E.Scalar {
             try validateCommitmentList(commitment_list);
+            // RFC 9591 §5.2: the signer must confirm that the commitment carried
+            // in the list for its own identifier was actually derived from the
+            // nonces it is about to use. Without this a coordinator can replay
+            // one set of nonces against several different commitment lists;
+            // each reply is a fresh linear equation in the long-term share, and
+            // a handful of them solve for sk_i. Binding the nonces to a single
+            // commitment (and thus a single group commitment R) is what makes
+            // reuse detectable here.
+            const own = for (commitment_list) |c| {
+                if (c.identifier == identifier) break c;
+            } else return error.MissingOwnCommitment;
+            if (!own.hiding.eql(try E.Point.mulBase(nonces.hiding)) or
+                !own.binding.eql(try E.Point.mulBase(nonces.binding)))
+                return error.NonceCommitmentMismatch;
             const prefix = bindingFactorPrefix(group_pk, commitment_list, msg);
             const rho_i = bindingFactor(&prefix, identifier);
             const R = try groupCommitment(commitment_list, &prefix);
@@ -583,4 +597,34 @@ test "commitment list validation" {
     // duplicate identifier rejected
     const dup = [_]F.Commitment{ r1.commitment, r1.commitment };
     try std.testing.expectError(error.UnsortedCommitmentList, F.sign(1, sk, E.Point.generator, r1.nonces, "m", &dup));
+}
+
+test "sign rejects nonces that do not match the commitment list" {
+    const F = Frost(Secp256k1Sha256);
+    const E = curve.Secp256k1;
+    var prng = std.Random.DefaultPrng.init(11);
+    const rng = prng.random();
+
+    const sk = E.Scalar.random(rng);
+    const a = try F.commit(1, sk, rng);
+    const b = try F.commit(2, sk, rng);
+    const list = [_]F.Commitment{ a.commitment, b.commitment };
+
+    // Signing with a *different* set of nonces than the ones committed in the
+    // list is what nonce reuse looks like; it must be rejected, not answered.
+    const other = try F.commit(1, sk, rng);
+    try std.testing.expectError(
+        error.NonceCommitmentMismatch,
+        F.sign(1, sk, E.Point.generator, other.nonces, "m", &list),
+    );
+
+    // A list that omits the signer's own identifier is rejected too.
+    const only_two = [_]F.Commitment{b.commitment};
+    try std.testing.expectError(
+        error.MissingOwnCommitment,
+        F.sign(1, sk, E.Point.generator, a.nonces, "m", &only_two),
+    );
+
+    // The matching nonces still sign.
+    _ = try F.sign(1, sk, E.Point.generator, a.nonces, "m", &list);
 }

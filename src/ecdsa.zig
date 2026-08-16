@@ -57,6 +57,18 @@ pub fn Ecdsa(comptime P: type, comptime E: type) type {
             dk: Pl.DecryptionKey,
             /// Every signer's Paillier + Pedersen data, indexed by signer-1.
             parties: []const PartyData,
+
+            /// The invariants every round body relies on when it indexes
+            /// `parties[i - 1]` / `big_x[i - 1]` and loops `1..=n`. round1
+            /// checks these inline, but the CLI runs each later round in a
+            /// separate process that reloads `Keys` from a decoded `State`, so
+            /// a tampered frame with `i = 0` (u16 underflow to 65535) or
+            /// `n > parties.len` would otherwise index out of bounds. Every
+            /// round entry point revalidates.
+            pub fn validate(self: Keys) !void {
+                if (self.i < 1 or self.i > self.n or self.n < 2) return error.InvalidParams;
+                if (self.big_x.len != self.n or self.parties.len != self.n) return error.InvalidParams;
+            }
         };
 
         /// Convert a t-of-n VSS share to the additive share for a signing set.
@@ -233,8 +245,7 @@ pub fn Ecdsa(comptime P: type, comptime E: type) type {
         };
 
         pub fn round1(allocator: Allocator, keys: Keys, rng: std.Random) !Round1Result {
-            if (keys.i < 1 or keys.i > keys.n or keys.n < 2) return error.InvalidParams;
-            if (keys.big_x.len != keys.n or keys.parties.len != keys.n) return error.InvalidParams;
+            try keys.validate();
 
             const gamma_i = E.Scalar.random(rng);
             const k_i = E.Scalar.random(rng);
@@ -329,6 +340,7 @@ pub fn Ecdsa(comptime P: type, comptime E: type) type {
             rng: std.Random,
         ) !Round2Result {
             const keys = state.keys;
+            try keys.validate();
             const n = keys.n;
             if (incoming_1a.len != n - 1 or incoming_1b.len != n - 1) return error.MissingMessage;
 
@@ -491,6 +503,7 @@ pub fn Ecdsa(comptime P: type, comptime E: type) type {
         pub fn round3(state: State2, incoming: []const From(Round2P2p), rng: std.Random) !Round3Result {
             var st = state;
             const keys = st.s1.keys;
+            try keys.validate();
             const n = keys.n;
             if (incoming.len != n - 1) return error.MissingMessage;
 
@@ -589,6 +602,7 @@ pub fn Ecdsa(comptime P: type, comptime E: type) type {
             var st = state;
             const allocator = st.allocator;
             const keys = st.s1.keys;
+            try keys.validate();
             const n = keys.n;
             if (incoming.len != n - 1) return error.MissingMessage;
 

@@ -96,6 +96,16 @@ pub fn Dkg(comptime E: type) type {
                 if (self.vss_commitment.len != self.threshold) return error.InvalidCommitmentLength;
                 // The constant term of the commitment *is* the group key.
                 if (!self.vss_commitment[0].eql(self.public_key)) return error.InconsistentShare;
+                // The secret share must lie on the committed polynomial:
+                // secret_share * G == F(party). finalize() enforces exactly
+                // this before ever writing a share out (see agg_com.verifyShare
+                // below). Without repeating it here, a share reloaded from disk
+                // with a corrupted or substituted secret_share but intact
+                // public fields passes validation and then makes every signing
+                // session emit an invalid aggregate signature.
+                const expected = try self.publicShareOf(self.party);
+                if (!(try E.Point.mulBase(self.secret_share)).eql(expected))
+                    return error.InconsistentShare;
             }
 
             /// Public key share of any party: F(j) in the exponent.
@@ -104,7 +114,7 @@ pub fn Dkg(comptime E: type) type {
                     .points = self.vss_commitment,
                     .allocator = self.allocator,
                 };
-                return com.evaluate(vss.shareIndex(E, party_j));
+                return com.evaluate(try vss.shareIndex(E, party_j));
             }
 
             pub fn deinit(self: *KeyShare) void {
@@ -242,6 +252,10 @@ pub fn Dkg(comptime E: type) type {
         /// `incoming` must contain exactly one Round1Broadcast from every other party.
         pub fn round2(state: State1, incoming: []const From(Round1Broadcast)) !Round2Result {
             const params = state.params;
+            // round1 validated these, but the CLI reloads the state from a
+            // decoded frame between rounds; a tampered frame with party = 0
+            // would underflow `party - 1` below. Same in round3 and finalize.
+            try params.validate();
             const allocator = state.allocator;
 
             const hashes = try allocator.alloc(?[32]u8, params.n);
@@ -269,7 +283,7 @@ pub fn Dkg(comptime E: type) type {
             var j: u16 = 1;
             while (j <= params.n) : (j += 1) {
                 if (j == params.party) continue;
-                p2p[k] = .{ .to = j, .msg = .{ .share = state.poly.share(j) } };
+                p2p[k] = .{ .to = j, .msg = .{ .share = try state.poly.share(j) } };
                 k += 1;
             }
 
@@ -321,6 +335,7 @@ pub fn Dkg(comptime E: type) type {
         ) !Round3Result {
             var st = state;
             const params = st.s1.params;
+            try params.validate();
             const allocator = st.s1.allocator;
 
             if (incoming_bc.len != params.n - 1 or incoming_p2p.len != params.n - 1)
@@ -345,7 +360,7 @@ pub fn Dkg(comptime E: type) type {
             const agg = try allocator.dupe(E.Point, st.s1.feldman);
             errdefer allocator.free(agg);
 
-            var secret_share = st.s1.poly.share(params.party);
+            var secret_share = try st.s1.poly.share(params.party);
 
             for (incoming_bc) |m| {
                 const j = m.from;
@@ -407,6 +422,7 @@ pub fn Dkg(comptime E: type) type {
         pub fn finalize(state: State3, incoming: []const From(Round3Broadcast)) !KeyShare {
             var st = state;
             const params = st.params;
+            try params.validate();
             const allocator = st.allocator;
 
             if (incoming.len != params.n - 1) return error.MissingMessage;
@@ -585,6 +601,14 @@ test "key share validation catches shapes finalize can never produce" {
     var wrong_key = shares[0];
     wrong_key.public_key = E.Point.generator;
     try std.testing.expectError(error.InconsistentShare, wrong_key.validate());
+
+    // A secret_share that no longer lies on the committed polynomial (a
+    // bit-flip on disk, or a substituted value) must be caught even though
+    // every public field is intact - otherwise the share silently produces
+    // invalid signatures in every session.
+    var tampered = shares[0];
+    tampered.secret_share = shares[0].secret_share.add(E.Scalar.one);
+    try std.testing.expectError(error.InconsistentShare, tampered.validate());
 
     var bad_party = shares[0];
     bad_party.party = 9;

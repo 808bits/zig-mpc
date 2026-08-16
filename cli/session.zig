@@ -263,6 +263,36 @@ pub const Session = struct {
         return join(self.env.gpa, &.{ self.path, artifacts_dir, name });
     }
 
+    /// Write `data` to `sub_path` so that a crash never leaves a truncated or
+    /// empty file at the destination. A plain writeFile returns while the bytes
+    /// are still in the page cache; finalize then deletes the round state that
+    /// would let this party re-derive its share, so a power loss in that window
+    /// could lose the share for good. Write to a temp file, fsync its contents,
+    /// then atomically rename it into place - the destination only ever appears
+    /// with complete, synced contents.
+    fn writeFileDurable(
+        self: *Session,
+        sub_path: []const u8,
+        data: []const u8,
+        flags: std.Io.Dir.CreateFileOptions,
+    ) !void {
+        const io = self.env.io;
+        const tmp_path = try std.fmt.allocPrint(self.env.gpa, "{s}.tmp", .{sub_path});
+        try Dir.cwd().writeFile(io, .{ .sub_path = tmp_path, .data = data, .flags = flags });
+
+        // If the fsync fails the bytes may never reach disk, and the caller
+        // will go on to delete the round state this file replaces - so a sync
+        // failure must abort the write, not be shrugged off.
+        var f = try Dir.cwd().openFile(io, tmp_path, .{});
+        f.sync(io) catch |err| {
+            f.close(io);
+            return err;
+        };
+        f.close(io);
+
+        try Dir.cwd().rename(tmp_path, Dir.cwd(), sub_path, io);
+    }
+
     pub fn saveArtifact(
         self: *Session,
         comptime T: type,
@@ -284,11 +314,11 @@ pub const Session = struct {
         }, payload);
 
         const path = try self.artifactPath(name);
-        try Dir.cwd().writeFile(self.env.io, .{
-            .sub_path = path,
-            .data = bytes,
-            .flags = if (secret) .{ .permissions = secret_file } else .{},
-        });
+        try self.writeFileDurable(
+            path,
+            bytes,
+            if (secret) .{ .permissions = secret_file } else .{},
+        );
         return path;
     }
 

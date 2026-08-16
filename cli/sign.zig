@@ -405,7 +405,7 @@ fn verifyFor(
 
     if (comptime tag == .taproot) {
         var pk: [32]u8 = undefined;
-        _ = std.fmt.hexToBytes(&pk, pubkey_hex) catch {
+        cmd.hexExact(&pk, pubkey_hex) catch {
             try ctx.warn("--pubkey must be 32 bytes of hex (x-only)\n", .{});
             return cmd.Exit.usage;
         };
@@ -419,7 +419,7 @@ fn verifyFor(
         }
     } else {
         var pk_bytes: [E.Point.encoded_length]u8 = undefined;
-        _ = std.fmt.hexToBytes(&pk_bytes, pubkey_hex) catch {
+        cmd.hexExact(&pk_bytes, pubkey_hex) catch {
             try ctx.warn(
                 "--pubkey must be {d} bytes of hex\n",
                 .{E.Point.encoded_length},

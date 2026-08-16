@@ -58,6 +58,17 @@ pub const Ctx = struct {
     }
 };
 
+/// Decode hex into a fixed-size buffer, requiring exactly `out.len` bytes.
+///
+/// std.fmt.hexToBytes tolerates short input: it fills only a leading prefix
+/// and returns a shorter slice, leaving the tail of `out` uninitialized. For
+/// key material and public keys that silently signs under (or verifies
+/// against) stack garbage, so every fixed-size hex input must go through here.
+pub fn hexExact(out: []u8, text: []const u8) !void {
+    const decoded = std.fmt.hexToBytes(out, text) catch return error.InvalidHex;
+    if (decoded.len != out.len) return error.InvalidHex;
+}
+
 /// Read a message to sign: raw bytes from a file, or hex on the command line.
 pub fn readMessage(ctx: Ctx, msg_file: ?[]const u8, msg_hex: ?[]const u8) ![]const u8 {
     if (msg_file) |path| {

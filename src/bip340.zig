@@ -247,7 +247,7 @@ test "FROST-Taproot: DKG-free dealer keys, threshold sign, BIP-340 verify" {
         defer com.deinit();
 
         var pk = com.publicKey();
-        var shares = [_]E.Scalar{ poly.share(1), poly.share(2), poly.share(3) };
+        var shares = [_]E.Scalar{ try poly.share(1), try poly.share(2), try poly.share(3) };
         // normalize to even-Y key material (each party negates its own share)
         var s1 = shares[0];
         const negated = normalizeKeyMaterial(&s1, &pk, com.points);
@@ -266,7 +266,7 @@ test "FROST-Taproot: DKG-free dealer keys, threshold sign, BIP-340 verify" {
         const z3 = try F.sign(3, shares[2], pk, c3.nonces, msg, &commitment_list);
 
         // share-level verification (identifiable abort) against normalized commitment
-        const pk1 = try com.evaluate(vss.shareIndex(E, 1));
+        const pk1 = try com.evaluate(try vss.shareIndex(E, 1));
         try std.testing.expect(try F.verifySigShare(1, pk1, z1, pk, msg, &commitment_list));
 
         const sig = try F.aggregate(&commitment_list, msg, pk, &.{ z1, z3 });
