@@ -284,7 +284,17 @@ pub const Ed25519 = struct {
         pub const identity = Point{ .p = C.identityElement };
 
         pub fn fromBytes(bytes: [32]u8) !Point {
-            return .{ .p = try C.fromBytes(bytes) };
+            const p = try C.fromBytes(bytes);
+            // Edwards25519 has cofactor 8, so on-curve is not enough: a peer can
+            // encode a low-order torsion point or a prime-order point plus a
+            // torsion component. Either injects a small-subgroup component into
+            // aggregated commitments and nonces, and lets two encodings map to
+            // the same effective point. Reject anything outside the prime-order
+            // subgroup so serde's canonical guarantee actually holds. The
+            // prime-order curves (secp256k1, P-256, P-384) are cofactor 1 and
+            // need no such check.
+            p.rejectUnexpectedSubgroup() catch return error.InvalidEncoding;
+            return .{ .p = p };
         }
 
         pub fn toBytes(self: Point) [32]u8 {
@@ -359,6 +369,21 @@ test "point arithmetic and encoding (all curves)" {
         try std.testing.expect(g3.sub(E.Point.generator).eql(E.Point.generator.add(E.Point.generator)));
         try std.testing.expect(!g3.isIdentity());
     }
+}
+
+test "Ed25519 fromBytes rejects points outside the prime-order subgroup" {
+    const E = Ed25519;
+    // A prime-order point (a base-point multiple) still decodes.
+    const good = try E.Point.mulBase(E.Scalar.fromU64(7));
+    const dec = try E.Point.fromBytes(good.toBytes());
+    try std.testing.expect(dec.eql(good));
+
+    // A known order-8 torsion point must be rejected: on-curve is not enough on
+    // a cofactor-8 curve, and accepting it would inject a small-subgroup
+    // component into aggregated commitments and nonces.
+    var torsion: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&torsion, "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a");
+    try std.testing.expectError(error.InvalidEncoding, E.Point.fromBytes(torsion));
 }
 
 test "wide reduction matches modular arithmetic" {

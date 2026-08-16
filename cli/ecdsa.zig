@@ -565,7 +565,7 @@ pub fn verify(
         return cmd.Exit.bad_input;
     }
     var pk_bytes: [33]u8 = undefined;
-    _ = std.fmt.hexToBytes(&pk_bytes, pubkey_hex) catch {
+    cmd.hexExact(&pk_bytes, pubkey_hex) catch {
         try ctx.warn("--pubkey must be 33 bytes of hex (compressed secp256k1)\n", .{});
         return cmd.Exit.usage;
     };

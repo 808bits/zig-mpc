@@ -747,6 +747,10 @@ fn signAggregate(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    // Guard before touching the caller's arrays: count == 0 would make the
+    // commit_ptrs[0] read below walk past their start.
+    if (count == 0) return ZMPC_ERR_INVALID_ARG;
+
     const key = loadKeyShare(tag, arena, share_bytes) catch return ZMPC_ERR_INVALID_ARG;
 
     // The session id comes from the frames themselves; commitmentList checks

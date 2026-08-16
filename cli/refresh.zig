@@ -228,7 +228,18 @@ fn finalize(comptime E: type, ctx: cmd.Ctx, s: *session.Session, share_override:
     // through - a mix of refreshed and stale shares cannot sign.
     const backup = try std.fmt.allocPrint(ctx.gpa, "{s}.old", .{loaded.path});
     const previous = try cmd.readFileBytes(ctx, loaded.path);
-    try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = backup, .data = previous });
+    // The backup holds a live secret share (t of them still reconstruct the
+    // group key until every party refreshes), so it must be 0600 like the
+    // original and the new share below, not left world-readable under the
+    // default umask.
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{
+        .sub_path = backup,
+        .data = previous,
+        .flags = .{ .permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode"))
+            .fromMode(0o600)
+        else
+            .default_file },
+    });
 
     const payload = try mpc.serde.encodeAlloc(D.KeyShare, share, ctx.gpa);
     const bytes = try frame.encodeAlloc(ctx.gpa, .{

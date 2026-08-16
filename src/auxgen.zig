@@ -157,6 +157,16 @@ pub fn AuxGen(comptime P: type, comptime M: usize) type {
             pedersen: Aux,
             pedersen_secret: Aux.Secret,
             decommitment: Round2Broadcast,
+
+            /// round1 checks this inline, but the CLI reloads State1 from a
+            /// decoded frame before each later round. A tampered frame with
+            /// `party = 0` underflows `party - 1` (u16 wraps to 65535) into an
+            /// out-of-bounds index, and `party > n_parties` walks the j-loops
+            /// past the allocations, so every round entry point revalidates.
+            pub fn validate(self: State1) !void {
+                if (self.party < 1 or self.party > self.n_parties or self.n_parties < 2)
+                    return error.InvalidParams;
+            }
         };
 
         pub const Round1Result = struct { state: State1, broadcast: Round1Broadcast };
@@ -212,6 +222,7 @@ pub fn AuxGen(comptime P: type, comptime M: usize) type {
         pub const Round2Result = struct { state: State2, broadcast: Round2Broadcast };
 
         pub fn round2(allocator: Allocator, state: State1, incoming: []const From(Round1Broadcast)) !Round2Result {
+            try state.validate();
             const n = state.n_parties;
             const hashes = try allocator.alloc(?[32]u8, n);
             errdefer allocator.free(hashes);
@@ -246,6 +257,7 @@ pub fn AuxGen(comptime P: type, comptime M: usize) type {
         pub fn round3(state: State2, rng: std.Random, incoming: []const From(Round2Broadcast)) !Round3Result {
             var st = state;
             const s1 = st.s1;
+            try s1.validate();
             const n = s1.n_parties;
             const allocator = st.allocator;
             if (incoming.len != n - 1) return error.MissingMessage;
@@ -316,6 +328,7 @@ pub fn AuxGen(comptime P: type, comptime M: usize) type {
 
         pub fn finalize(state: State3, rng: std.Random, incoming: []const From(Round3P2p)) !AuxInfo {
             const s1 = state.s1;
+            try s1.validate();
             const n = s1.n_parties;
             const allocator = state.allocator;
             if (incoming.len != n - 1) return error.MissingMessage;

@@ -9,8 +9,15 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 /// The scalar x-coordinate assigned to party `index` (1-based).
-pub fn shareIndex(comptime E: type, index: u16) E.Scalar {
-    std.debug.assert(index >= 1);
+///
+/// Party 0 is the secret's own x-coordinate (f(0) = secret), never a party.
+/// This used to be a debug-only assert, which compiles out in ReleaseFast /
+/// ReleaseSmall, so in a release build a coordinator-supplied index of 0 would
+/// flow through `publicShareOf`/`verifyShare` and turn them into an oracle
+/// against the group secret. It is a returned error so the guard survives in
+/// every build mode.
+pub fn shareIndex(comptime E: type, index: u16) !E.Scalar {
+    if (index == 0) return error.InvalidPartyIndex;
     return E.Scalar.fromU64(index);
 }
 
@@ -58,8 +65,8 @@ pub fn Polynomial(comptime E: type) type {
         }
 
         /// The share for party `index` (1-based).
-        pub fn share(self: Self, index: u16) E.Scalar {
-            return self.evaluate(shareIndex(E, index));
+        pub fn share(self: Self, index: u16) !E.Scalar {
+            return self.evaluate(try shareIndex(E, index));
         }
 
         /// Feldman commitment: A_k = coeff_k * G.
@@ -114,7 +121,8 @@ pub fn Commitment(comptime E: type) type {
 
         /// Verify that `share_value` is a consistent share for party `index`.
         pub fn verifyShare(self: Self, index: u16, share_value: E.Scalar) bool {
-            const expected = self.evaluate(shareIndex(E, index)) catch return false;
+            const x = shareIndex(E, index) catch return false;
+            const expected = self.evaluate(x) catch return false;
             const actual = E.Point.mulBase(share_value) catch return false;
             return expected.eql(actual);
         }
@@ -146,10 +154,10 @@ pub fn lagrangeAt(comptime E: type, indices: []const u16, j: usize, x: E.Scalar)
     }
     var num = E.Scalar.one;
     var den = E.Scalar.one;
-    const xj = shareIndex(E, indices[j]);
+    const xj = try shareIndex(E, indices[j]);
     for (indices, 0..) |idx, m| {
         if (m == j) continue;
-        const xm = shareIndex(E, idx);
+        const xm = try shareIndex(E, idx);
         num = num.mul(xm.sub(x));
         den = den.mul(xm.sub(xj));
     }
@@ -180,13 +188,13 @@ test "share and reconstruct (all curves)" {
 
         // any 3 of 5 shares reconstruct
         const indices = [_]u16{ 2, 4, 5 };
-        const shares = [_]E.Scalar{ poly.share(2), poly.share(4), poly.share(5) };
+        const shares = [_]E.Scalar{ try poly.share(2), try poly.share(4), try poly.share(5) };
         const rec = try reconstructAtZero(E, &indices, &shares);
         try std.testing.expect(rec.eql(secret));
 
         // 2 shares reconstruct something else
         const indices2 = [_]u16{ 2, 4 };
-        const shares2 = [_]E.Scalar{ poly.share(2), poly.share(4) };
+        const shares2 = [_]E.Scalar{ try poly.share(2), try poly.share(4) };
         const wrong = try reconstructAtZero(E, &indices2, &shares2);
         try std.testing.expect(!wrong.eql(secret));
     }
@@ -207,13 +215,13 @@ test "feldman verification accepts good shares, rejects bad" {
 
         var i: u16 = 1;
         while (i <= 6) : (i += 1) {
-            try std.testing.expect(com.verifyShare(i, poly.share(i)));
+            try std.testing.expect(com.verifyShare(i, try poly.share(i)));
         }
         // tampered share fails
-        const bad = poly.share(3).add(E.Scalar.one);
+        const bad = (try poly.share(3)).add(E.Scalar.one);
         try std.testing.expect(!com.verifyShare(3, bad));
         // right share, wrong index fails
-        try std.testing.expect(!com.verifyShare(2, poly.share(3)));
+        try std.testing.expect(!com.verifyShare(2, try poly.share(3)));
 
         // commitment[0] is the public key secret*G
         const pk = try E.Point.mulBase(secret);
@@ -243,7 +251,7 @@ test "commitment homomorphic addition matches summed polynomials" {
     // summed shares verify against summed commitment
     var i: u16 = 1;
     while (i <= 4) : (i += 1) {
-        const sum_share = p1.share(i).add(p2.share(i));
+        const sum_share = (try p1.share(i)).add(try p2.share(i));
         try std.testing.expect(c1.verifyShare(i, sum_share));
     }
 }
@@ -262,4 +270,22 @@ test "lagrange coefficients sum property" {
     // duplicate indices rejected
     const dup = [_]u16{ 1, 3, 3 };
     try std.testing.expectError(error.DuplicateIndex, lagrangeAtZero(E, &dup, 0));
+}
+
+test "party index 0 is rejected in every build mode" {
+    const curve = @import("curve.zig");
+    const E = curve.Secp256k1;
+    // This must be a returned error, not a debug-only assert: index 0 is the
+    // secret's own x-coordinate, and letting it reach publicShareOf/verifyShare
+    // turns them into an oracle against the group secret in release builds.
+    try std.testing.expectError(error.InvalidPartyIndex, shareIndex(E, 0));
+
+    var prng = std.Random.DefaultPrng.init(3);
+    const rng = prng.random();
+    var poly = try Polynomial(E).initRandom(std.testing.allocator, E.Scalar.random(rng), 2, rng);
+    defer poly.deinit();
+    var com = try poly.commit(std.testing.allocator);
+    defer com.deinit();
+    // verifyShare must not accept party 0 against the group public key.
+    try std.testing.expect(!com.verifyShare(0, E.Scalar.one));
 }

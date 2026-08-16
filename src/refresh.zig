@@ -55,7 +55,8 @@ pub fn Refresh(comptime E: type) type {
         }
 
         fn verifyZeroShare(tail: []const E.Point, index: u16, share: E.Scalar) bool {
-            const expected = evalTail(tail, vss.shareIndex(E, index)) orelse return false;
+            const x = vss.shareIndex(E, index) catch return false;
+            const expected = evalTail(tail, x) orelse return false;
             const actual = E.Point.mulBase(share) catch return false;
             return expected.eql(actual);
         }
@@ -86,6 +87,16 @@ pub fn Refresh(comptime E: type) type {
             tail: []E.Point,
             decommit_nonce: [32]u8,
             allocator: Allocator,
+
+            /// round1 copies these from a validated KeyShare, but the CLI
+            /// reloads State1 from a decoded frame between rounds; a tampered
+            /// frame with party = 0 underflows `party - 1` in round2, so the
+            /// later rounds revalidate. finalize additionally cross-checks the
+            /// state against the freshly validated share it updates.
+            fn validate(self: State1) !void {
+                if (self.party < 1 or self.party > self.n or self.n < 2) return error.InvalidParams;
+                if (self.threshold < 1) return error.InvalidParams;
+            }
 
             fn evalPoly(self: State1, x: E.Scalar) E.Scalar {
                 var acc = E.Scalar.zero;
@@ -171,6 +182,7 @@ pub fn Refresh(comptime E: type) type {
         };
 
         pub fn round2(state: State1, incoming: []const From(Round1Broadcast)) !Round2Result {
+            try state.validate();
             const allocator = state.allocator;
             const n = state.n;
 
@@ -191,7 +203,7 @@ pub fn Refresh(comptime E: type) type {
             var j: u16 = 1;
             while (j <= n) : (j += 1) {
                 if (j == state.party) continue;
-                p2p[k] = .{ .to = j, .msg = .{ .share = state.evalPoly(vss.shareIndex(E, j)) } };
+                p2p[k] = .{ .to = j, .msg = .{ .share = state.evalPoly(try vss.shareIndex(E, j)) } };
                 k += 1;
             }
 
@@ -214,6 +226,7 @@ pub fn Refresh(comptime E: type) type {
             incoming_p2p: []const From(Round2P2p),
         ) !void {
             var st = state;
+            try st.s1.validate();
             const allocator = st.s1.allocator;
             const n = st.s1.n;
             const t_deg = st.s1.threshold;
@@ -227,7 +240,7 @@ pub fn Refresh(comptime E: type) type {
             @memset(seen, false);
             seen[share.party - 1] = true;
 
-            var delta = st.s1.evalPoly(vss.shareIndex(E, share.party));
+            var delta = st.s1.evalPoly(try vss.shareIndex(E, share.party));
             const new_tail = try allocator.alloc(E.Point, t_deg - 1);
             defer allocator.free(new_tail);
             @memcpy(new_tail, st.s1.tail);

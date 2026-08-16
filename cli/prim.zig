@@ -74,7 +74,7 @@ pub fn bip340(ctx: cmd.Ctx, args: *Args) !u8 {
 
     if (eql(action, "pubkey")) {
         var sk: [32]u8 = undefined;
-        _ = std.fmt.hexToBytes(&sk, try args.require("sk")) catch {
+        cmd.hexExact(&sk, try args.require("sk")) catch {
             try ctx.warn("--sk must be 32 bytes of hex\n", .{});
             return cmd.Exit.usage;
         };
@@ -97,7 +97,7 @@ pub fn bip340(ctx: cmd.Ctx, args: *Args) !u8 {
 
     if (eql(action, "sign")) {
         var sk: [32]u8 = undefined;
-        _ = std.fmt.hexToBytes(&sk, try args.require("sk")) catch {
+        cmd.hexExact(&sk, try args.require("sk")) catch {
             try ctx.warn("--sk must be 32 bytes of hex\n", .{});
             return cmd.Exit.usage;
         };
@@ -106,7 +106,7 @@ pub fn bip340(ctx: cmd.Ctx, args: *Args) !u8 {
         // deterministic for test vectors.
         var aux: [32]u8 = undefined;
         if (args.value("aux")) |text| {
-            _ = std.fmt.hexToBytes(&aux, text) catch {
+            cmd.hexExact(&aux, text) catch {
                 try ctx.warn("--aux must be 32 bytes of hex\n", .{});
                 return cmd.Exit.usage;
             };
@@ -123,13 +123,13 @@ pub fn bip340(ctx: cmd.Ctx, args: *Args) !u8 {
 
     if (eql(action, "verify")) {
         var pk: [32]u8 = undefined;
-        _ = std.fmt.hexToBytes(&pk, try args.require("pubkey")) catch {
+        cmd.hexExact(&pk, try args.require("pubkey")) catch {
             try ctx.warn("--pubkey must be 32 bytes of hex (x-only)\n", .{});
             return cmd.Exit.usage;
         };
         const sig_text = try args.require("sig");
         var sig: [64]u8 = undefined;
-        if (std.fmt.hexToBytes(&sig, sig_text)) |_| {} else |_| {
+        if (cmd.hexExact(&sig, sig_text)) |_| {} else |_| {
             const bytes = cmd.readFileBytes(ctx, sig_text) catch {
                 try ctx.warn("--sig is neither 64 bytes of hex nor a readable file\n", .{});
                 return cmd.Exit.bad_input;
@@ -403,7 +403,7 @@ fn vssFor(comptime E: type, ctx: cmd.Ctx, args: *Args, action: []const u8) !u8 {
         for (com.points) |p| try ctx.emit("commitment {x}\n", .{&p.toBytes()});
         var i: u16 = 1;
         while (i <= n) : (i += 1) {
-            try ctx.emit("share {d} {x}\n", .{ i, &poly.share(i).toBytes() });
+            try ctx.emit("share {d} {x}\n", .{ i, &(try poly.share(i)).toBytes() });
         }
         return cmd.Exit.ok;
     }

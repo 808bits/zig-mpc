@@ -140,12 +140,24 @@ fn handle(ctx: cmd.Ctx, stream: net.Stream, spool: []const u8) !void {
             if (count > max_batch) return error.TooManyFrames;
             try Dir.cwd().createDirPath(ctx.io, dir);
 
+            // Each frame is buffered, matched against the spool, written, and
+            // then no longer needed. The connection arena never frees between
+            // iterations, so without this a single push of count * up to
+            // max_frame_bytes (4096 * 32MB ~= 128GB) would grow unbounded and
+            // OOM the relay. Scope every per-frame allocation to this scratch
+            // arena and reset it each iteration, capping peak memory at roughly
+            // two frames regardless of how many the batch claims.
+            var frame_arena = std.heap.ArenaAllocator.init(ctx.gpa);
+            defer frame_arena.deinit();
+            const fa = frame_arena.allocator();
+
             var stored: u32 = 0;
             var i: u32 = 0;
             while (i < count) : (i += 1) {
+                _ = frame_arena.reset(.retain_capacity);
                 const len = try readU32(r);
                 if (len > max_frame_bytes) return error.FrameTooLarge;
-                const bytes = try ctx.gpa.alloc(u8, len);
+                const bytes = try fa.alloc(u8, len);
                 try r.readSliceAll(bytes);
 
                 // Parse only the header: enough to route the frame, not
@@ -169,15 +181,15 @@ fn handle(ctx: cmd.Ctx, stream: net.Stream, spool: []const u8) !void {
 
                 var name_buf: [128]u8 = undefined;
                 const name = try frame.fileName(&name_buf, peek.header, frame.isArmored(bytes));
-                const target = try session.join(ctx.gpa, &.{ dir, name });
+                const target = try session.join(fa, &.{ dir, name });
 
                 // Never silently replace a spooled frame with different
                 // content: keep both so the recipient's consistency check can
                 // see the contradiction.
-                if (Dir.cwd().readFileAlloc(ctx.io, target, ctx.gpa, .limited(max_frame_bytes))) |existing| {
+                if (Dir.cwd().readFileAlloc(ctx.io, target, fa, .limited(max_frame_bytes))) |existing| {
                     if (!std.mem.eql(u8, existing, bytes)) {
                         const alt = try std.fmt.allocPrint(
-                            ctx.gpa,
+                            fa,
                             "{s}/conflict{d}-{s}",
                             .{ dir, stored, name },
                         );

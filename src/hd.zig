@@ -155,11 +155,11 @@ test "threshold signing under a derived child key" {
     var poly = try vss.Polynomial(E).initRandom(allocator, child_secret, 2, rng);
     defer poly.deinit();
     const msg = "hd child signing";
-    const c1 = try F.commit(1, poly.share(1), rng);
-    const c2 = try F.commit(2, poly.share(2), rng);
+    const c1 = try F.commit(1, try poly.share(1), rng);
+    const c2 = try F.commit(2, try poly.share(2), rng);
     const list = [_]F.Commitment{ c1.commitment, c2.commitment };
-    const z1 = try F.sign(1, poly.share(1), step.child.pk, c1.nonces, msg, &list);
-    const z2 = try F.sign(2, poly.share(2), step.child.pk, c2.nonces, msg, &list);
+    const z1 = try F.sign(1, try poly.share(1), step.child.pk, c1.nonces, msg, &list);
+    const z2 = try F.sign(2, try poly.share(2), step.child.pk, c2.nonces, msg, &list);
     const sig = try F.aggregate(&list, msg, step.child.pk, &.{ z1, z2 });
     try std.testing.expect(F.verify(msg, step.child.pk, sig));
 }
