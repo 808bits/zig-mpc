@@ -148,7 +148,7 @@ fn round3(comptime E: type, ctx: cmd.Ctx, s: *session.Session) !u8 {
     const bc = try cmd.collectFrom(ctx, D.Round2Broadcast, inbox, 2, .broadcast, try s.participants(), m.party);
     const p2p = try cmd.collectFrom(ctx, D.Round2P2p, inbox, 2, .p2p, try s.participants(), m.party);
 
-    const result = D.round3(state, bc, p2p) catch |err| return protocolError(ctx, err);
+    const result = D.round3(state, bc, p2p) catch |err| return cmd.protocolAbort(ctx, "key generation", err, null);
 
     _ = try s.emit(D.Round3Broadcast, result.broadcast, header(s, 3, .broadcast, 0), ctx.armor);
     try s.saveState(D.State3, result.state, 3);
@@ -171,7 +171,7 @@ fn finalize(comptime E: type, ctx: cmd.Ctx, s: *session.Session) !u8 {
     const state = try s.loadState(D.State3, 3);
     const bc = try cmd.collectFrom(ctx, D.Round3Broadcast, inbox, 3, .broadcast, try s.participants(), m.party);
 
-    var share = D.finalize(state, bc) catch |err| return protocolError(ctx, err);
+    var share = D.finalize(state, bc) catch |err| return cmd.protocolAbort(ctx, "key generation", err, null);
 
     // BIP-340 keys are x-only with an implicit even Y. If the DKG landed on an
     // odd-Y group key, every party negates its own key material now, so that
@@ -205,24 +205,4 @@ fn finalize(comptime E: type, ctx: cmd.Ctx, s: *session.Session) !u8 {
         try ctx.emit("{x}\n", .{&share.public_key.toBytes()});
     }
     return cmd.Exit.ok;
-}
-
-fn protocolError(ctx: cmd.Ctx, err: anyerror) !u8 {
-    try ctx.warn("protocol aborted: {t}\n", .{err});
-    switch (err) {
-        error.InvalidShare => try ctx.warn(
-            "a peer sent a VSS share inconsistent with its published commitment\n",
-            .{},
-        ),
-        error.DecommitmentMismatch => try ctx.warn(
-            "a peer opened a commitment it did not make in round 1\n",
-            .{},
-        ),
-        error.InvalidSchnorrProof => try ctx.warn(
-            "a peer failed to prove knowledge of its secret contribution\n",
-            .{},
-        ),
-        else => {},
-    }
-    return cmd.Exit.protocol;
 }

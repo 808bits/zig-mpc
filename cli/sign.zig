@@ -327,20 +327,15 @@ fn aggregate(
     for (parties, shares) |p, sig_share| {
         const pk_i = try key.publicShareOf(p);
         const ok = F.verifySigShare(p, pk_i, sig_share, key.public_key, msg, list) catch false;
-        if (!ok) {
-            try ctx.warn("party {d} produced an invalid signature share\n", .{p});
-            try ctx.warn(
-                "it signed a different message, used a different key share, or is faulty\n",
-                .{},
-            );
-            return cmd.Exit.protocol;
-        }
+        if (!ok) return cmd.protocolAbortReason(ctx, "signing", .{
+            .reason = .invalid_signature_share,
+            .culprit = p,
+        });
     }
 
     const sig = try F.aggregate(list, msg, key.public_key, shares);
     if (!F.verify(msg, key.public_key, sig)) {
-        try ctx.warn("aggregated signature failed verification\n", .{});
-        return cmd.Exit.protocol;
+        return cmd.protocolAbortReason(ctx, "signing", .{ .reason = .aggregate_signature_invalid });
     }
 
     // Taproot signatures go out in the 64-byte BIP-340 wire format; the other

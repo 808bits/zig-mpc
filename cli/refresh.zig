@@ -198,20 +198,9 @@ fn finalize(comptime E: type, ctx: cmd.Ctx, s: *session.Session, share_override:
     const old_secret = share.secret_share;
 
     R.finalize(state, &share, bc, p2p) catch |err| {
-        try ctx.warn("refresh aborted: {t}\n", .{err});
-        switch (err) {
-            error.InvalidShare => try ctx.warn(
-                "a peer's zero-share does not match its published commitment\n",
-                .{},
-            ),
-            error.DecommitmentMismatch => try ctx.warn(
-                "a peer opened a commitment it did not make in round 1\n",
-                .{},
-            ),
-            else => {},
-        }
+        const code = try cmd.protocolAbort(ctx, "refresh", err, null);
         try ctx.warn("the key share on disk is unchanged\n", .{});
-        return cmd.Exit.protocol;
+        return code;
     };
 
     // The whole point: same key, different share.

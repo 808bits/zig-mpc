@@ -1,6 +1,7 @@
 //! zig-mpc: threshold signing (ECDSA via CGGMP24, Schnorr/EdDSA via FROST)
 //! built on the Zig standard library's cryptographic primitives.
 
+pub const abort = @import("abort.zig");
 pub const curve = @import("curve.zig");
 pub const transcript = @import("transcript.zig");
 pub const message = @import("message.zig");
@@ -21,6 +22,7 @@ pub const serde = @import("serde.zig");
 pub const testdata_paillier = @import("testdata/paillier_vectors.zig");
 
 test {
+    _ = abort;
     _ = serde;
     _ = ecdsa;
     _ = refresh;

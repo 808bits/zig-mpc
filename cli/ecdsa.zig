@@ -266,7 +266,7 @@ fn round2(comptime tag: suite_mod.Suite, ctx: cmd.Ctx, s: *session.Session) !u8 
     const p2p_in = try collectPositional(T.Round1bP2p, ctx, s, inbox, 1, .p2p);
 
     const result = T.round2(ctx.gpa, state, bc, p2p_in, ctx.rng) catch |err|
-        return protocolError(ctx, err, s);
+        return cmd.protocolAbort(ctx, "presigning", err, null);
 
     for (result.p2p) |out| {
         const party = try partyAt(s, out.to);
@@ -291,7 +291,7 @@ fn round3(comptime tag: suite_mod.Suite, ctx: cmd.Ctx, s: *session.Session) !u8 
     const state = try s.loadState(T.State2, 2);
     const incoming = try collectPositional(T.Round2P2p, ctx, s, inbox, 2, .p2p);
 
-    const result = T.round3(state, incoming, ctx.rng) catch |err| return protocolError(ctx, err, s);
+    const result = T.round3(state, incoming, ctx.rng) catch |err| return cmd.protocolAbort(ctx, "presigning", err, null);
 
     _ = try s.emit(T.Round3Broadcast, result.broadcast, header(s, 3, .broadcast, 0), ctx.armor);
     try s.saveState(T.State3, result.state, 3);
@@ -313,7 +313,7 @@ fn finalize(comptime tag: suite_mod.Suite, ctx: cmd.Ctx, s: *session.Session) !u
     const state = try s.loadState(T.State3, 3);
     const incoming = try collectPositional(T.Round3Broadcast, ctx, s, inbox, 3, .broadcast);
 
-    var presig = T.finalize(state, incoming) catch |err| return protocolError(ctx, err, s);
+    var presig = T.finalize(state, incoming) catch |err| return cmd.protocolAbort(ctx, "presigning", err, null);
 
     const path = try s.saveArtifact(T.Presignature, presig, presignature_file, .presignature, true);
     try s.advance(4);
@@ -328,32 +328,6 @@ fn finalize(comptime tag: suite_mod.Suite, ctx: cmd.Ctx, s: *session.Session) !u
         try ctx.emit("{s}\n", .{path});
     }
     return cmd.Exit.ok;
-}
-
-fn protocolError(ctx: cmd.Ctx, err: anyerror, s: *session.Session) !u8 {
-    _ = s;
-    try ctx.warn("presigning aborted: {t}\n", .{err});
-    switch (err) {
-        error.InvalidEncProof => try ctx.warn(
-            "a signer could not prove its encrypted nonce is in range\n",
-            .{},
-        ),
-        error.InvalidAffGProof => try ctx.warn(
-            "a signer's multiplicative-to-additive step failed its range proof\n",
-            .{},
-        ),
-        error.InvalidElogProof => try ctx.warn(
-            "a signer's discrete-log equality proof failed\n",
-            .{},
-        ),
-        error.MismatchedDelta => try ctx.warn(
-            "the combined δ does not match the group element; a signer cheated or\n" ++
-                "the signing set disagrees. CGGMP24 aborts here without assigning blame.\n",
-            .{},
-        ),
-        else => {},
-    }
-    return cmd.Exit.protocol;
 }
 
 // ---------------------------------------------------------------------------

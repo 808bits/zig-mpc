@@ -304,7 +304,7 @@ fn round3(comptime tag: suite_mod.Suite, ctx: cmd.Ctx, s: *session.Session) !u8 
         s.manifest.party,
     );
 
-    const result = A.round3(state, ctx.rng, incoming) catch |err| return protocolError(ctx, err);
+    const result = A.round3(state, ctx.rng, incoming) catch |err| return cmd.protocolAbort(ctx, "aux-info generation", err, null);
 
     for (result.p2p) |out| {
         _ = try s.emit(A.Round3P2p, out.msg, header(s, 3, .p2p, out.to), ctx.armor);
@@ -336,7 +336,7 @@ fn finalize(comptime tag: suite_mod.Suite, ctx: cmd.Ctx, s: *session.Session) !u
         s.manifest.party,
     );
 
-    const info = A.finalize(state, ctx.rng, incoming) catch |err| return protocolError(ctx, err);
+    const info = A.finalize(state, ctx.rng, incoming) catch |err| return cmd.protocolAbort(ctx, "aux-info generation", err, null);
 
     const path = try s.saveArtifact(A.AuxInfo, info, aux_info_file, .aux_info, true);
     try s.advance(4);
@@ -352,32 +352,4 @@ fn finalize(comptime tag: suite_mod.Suite, ctx: cmd.Ctx, s: *session.Session) !u
         try ctx.emit("{s}\n", .{path});
     }
     return cmd.Exit.ok;
-}
-
-fn protocolError(ctx: cmd.Ctx, err: anyerror) !u8 {
-    try ctx.warn("aux-info generation aborted: {t}\n", .{err});
-    switch (err) {
-        error.InvalidPrmProof => try ctx.warn(
-            "a peer could not prove its ring-Pedersen parameters are well formed\n",
-            .{},
-        ),
-        error.InvalidModProof => try ctx.warn(
-            "a peer's Paillier modulus is not a Blum integer\n",
-            .{},
-        ),
-        error.InvalidFacProof => try ctx.warn(
-            "a peer could not prove its modulus has no small factors\n",
-            .{},
-        ),
-        error.InvalidModulusSize => try ctx.warn(
-            "a peer offered an undersized modulus\n",
-            .{},
-        ),
-        error.DecommitmentMismatch => try ctx.warn(
-            "a peer opened a commitment it did not make in round 1\n",
-            .{},
-        ),
-        else => {},
-    }
-    return cmd.Exit.protocol;
 }

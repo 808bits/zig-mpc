@@ -63,6 +63,54 @@ pub const Ctx = struct {
     }
 };
 
+/// Report a failed round and return the exit code the caller should hand back.
+///
+/// `phase` names what was being attempted ("key generation", "presigning") and
+/// completes the sentence "<phase> aborted:". Pass `culprit` when the caller
+/// already knows which party produced the offending value; the rounds
+/// themselves do not report one yet.
+///
+/// Errors that are not protocol events at all (an allocation failure, an I/O
+/// error surfacing at a round boundary) come back as `Exit.internal`. Reporting
+/// those as an abort would blame the peers for a local problem, and would tell
+/// a script that the protocol failed when the machine did.
+pub fn protocolAbort(ctx: Ctx, phase: []const u8, err: anyerror, culprit: ?u16) !u8 {
+    const reason = mpc.abort.classify(err) orelse {
+        try ctx.warn("{s} failed: {t}\n", .{ phase, err });
+        return Exit.internal;
+    };
+    try ctx.warn("{s} aborted: {t}\n", .{ phase, err });
+    return abortTail(ctx, .{ .reason = reason, .culprit = culprit });
+}
+
+/// As `protocolAbort`, for a failure detected by a check that returns a bool
+/// rather than an error: FROST's per-share verification, for instance, which
+/// knows exactly whose share did not verify.
+pub fn protocolAbortReason(ctx: Ctx, phase: []const u8, a: mpc.abort.Abort) !u8 {
+    try ctx.warn("{s} aborted: {s}\n", .{ phase, a.summary() });
+    return abortTail(ctx, a);
+}
+
+fn abortTail(ctx: Ctx, a: mpc.abort.Abort) !u8 {
+    try ctx.warn("{s}\n", .{a.detail()});
+    if (a.culprit) |party| try ctx.warn("party {d} is responsible\n", .{party});
+    switch (a.kind()) {
+        .ban_counterparty => try ctx.warn(
+            "a correct peer cannot produce this; re-running with the same set will fail the same way\n",
+            .{},
+        ),
+        .unattributable => try ctx.warn(
+            "no single party can be blamed from the transcript alone\n",
+            .{},
+        ),
+        .recoverable => try ctx.warn(
+            "re-run the round once the missing or duplicated messages are sorted out\n",
+            .{},
+        ),
+    }
+    return Exit.protocol;
+}
+
 /// Print a command's whole help page and return the usage exit code.
 ///
 /// Reached whenever a command was given too little to act on: no step, or a
