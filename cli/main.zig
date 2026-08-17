@@ -16,6 +16,7 @@ pub const dkg = @import("dkg.zig");
 pub const ecdsa = @import("ecdsa.zig");
 pub const frame = @import("frame.zig");
 pub const hd = @import("hd.zig");
+pub const help = @import("help.zig");
 pub const prim = @import("prim.zig");
 pub const selftest_mod = @import("selftest.zig");
 pub const refresh = @import("refresh.zig");
@@ -28,62 +29,6 @@ const Args = args_mod.Args;
 
 /// Set by the build (`-Dversion=`); release tags stamp their own value in.
 pub const version = @import("build_options").version;
-
-const usage =
-    \\zmpc - threshold signing (FROST, CGGMP24) across processes and machines
-    \\
-    \\usage: zmpc <command> [options]
-    \\
-    \\sessions
-    \\  init          create a session directory for one party
-    \\  status        what this session has done and is waiting for
-    \\
-    \\protocols            (each: init? round1 round2 [round3] finalize | run)
-    \\  dkg           distributed key generation, any curve
-    \\  refresh       re-randomize shares; same public key, old shares dead
-    \\  auxgen        CGGMP24 aux info; also `auxgen primes` to pre-generate
-    \\  presign       CGGMP24 presigning, message-independent
-    \\  sign          FROST: commit | share | aggregate
-    \\
-    \\signing and keys
-    \\  ecdsa         sign | combine | verify     (uses a presignature)
-    \\  verify        check a FROST/Taproot signature against a public key
-    \\  share         info | pubkey | verify
-    \\  hd            pubkey | derive             (BIP-32/SLIP-10, non-hardened)
-    \\
-    \\primitives
-    \\  bip340        pubkey | sign | verify
-    \\  paillier      keygen | encrypt | decrypt | add | mul | addplain
-    \\  vss           split | reconstruct | verify
-    \\  ffx           prime | isprime | jacobi | gcd | inverse | sqrt | divrem
-    \\  transcript    hash
-    \\
-    \\relay transport (optional)
-    \\  relay         store-and-forward hub: --listen HOST:PORT [--spool DIR]
-    \\  push          upload this session's out/ to a relay
-    \\  pull          download frames addressed to this party into in/
-    \\  node          run a whole protocol to completion over a relay
-    \\
-    \\tools
-    \\  simulate      run whole protocols in one process
-    \\  selftest      known-answer tests against this binary
-    \\  inspect       decode any frame file
-    \\  version
-    \\
-    \\suites: ed25519 | secp256k1 | taproot | p256 | p384 | ecdsa_fast | ecdsa_prod
-    \\
-    \\common options
-    \\  --dir DIR     session directory (default: .)
-    \\  --armor       write frames as base64 text instead of binary
-    \\  --json        machine-readable result on stdout, human text on stderr
-    \\  --quiet       suppress progress notes
-    \\
-    \\A round reads in/ and state/, then writes out/ and state/. Deliver a
-    \\party's out/ files into its peers' in/ directories by any means you
-    \\trust - the frames are inert and named identically on both sides.
-    \\Exit 75 means "still waiting for messages", not failure.
-    \\
-;
 
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.arena.allocator();
@@ -113,6 +58,7 @@ pub fn main(init: std.process.Init) !u8 {
         .out = out,
         .err = err,
         .rng = csprng.random(),
+        .dir_from_env = envDir(init.minimal.environ, gpa),
         .armor = args.has("armor"),
         .json = args.has("json"),
         .quiet = args.has("quiet"),
@@ -120,23 +66,44 @@ pub fn main(init: std.process.Init) !u8 {
 
     const code = dispatch(&ctx, &args) catch |e| {
         try reportError(ctx, &args, e);
+        // A bad or missing option is a question about how the command is
+        // used, so answer it in full rather than one flag at a time.
+        if (errorExit(e) == cmd.Exit.usage) {
+            if (args.word(0)) |command| _ = try cmd.usagePage(ctx, command);
+        }
         return errorExit(e);
     };
     return code;
 }
 
+/// `ZMPC_DIR`, the default for `--dir`. An unset or empty value means "not
+/// set"; an empty string would otherwise name a directory that cannot exist,
+/// which is a confusing way to fail.
+fn envDir(environ: std.process.Environ, gpa: std.mem.Allocator) ?[]const u8 {
+    const value = environ.getAlloc(gpa, "ZMPC_DIR") catch return null;
+    return if (value.len == 0) null else value;
+}
+
 fn dispatch(ctx: *cmd.Ctx, args: *Args) !u8 {
+    // `help [topic]`, `--help` and `<command> --help` all reach the same
+    // pages. Asking for help is never an error, so these exit 0; running with
+    // no command at all is a usage mistake, so that one exits 2.
+    if (helpRequest(args)) |request| return showHelp(ctx, request.topic);
+
+    // `--dir` with nothing after it would otherwise fall back to ZMPC_DIR or
+    // the current directory, which is not what someone who typed it meant.
+    if (args.has("dir") and args.value("dir") == null) {
+        args.bad_flag = "dir";
+        return error.MissingValue;
+    }
+
     const command = args.word(0) orelse {
-        try ctx.out.writeAll(usage);
+        try ctx.out.writeAll(help.overview);
         return cmd.Exit.usage;
     };
 
     if (eql(command, "version")) {
         try ctx.emit("zmpc {s}\n", .{version});
-        return cmd.Exit.ok;
-    }
-    if (eql(command, "help") or eql(command, "--help")) {
-        try ctx.out.writeAll(usage);
         return cmd.Exit.ok;
     }
     if (eql(command, "init")) return cmdInit(ctx, args);
@@ -164,7 +131,7 @@ fn dispatch(ctx: *cmd.Ctx, args: *Args) !u8 {
     if (eql(command, "simulate")) return selftest_mod.simulate(ctx.*, args);
 
     try ctx.warn("unknown command '{s}'\n\n", .{command});
-    try ctx.out.writeAll(usage);
+    try ctx.out.writeAll(help.overview);
     return cmd.Exit.usage;
 }
 
@@ -172,8 +139,70 @@ fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
-fn sessionDir(args: *Args) []const u8 {
-    return args.valueOr("dir", ".");
+/// Did the user ask for help, and about what?
+///
+/// `zmpc help`, `zmpc help dkg`, `zmpc dkg --help`, `zmpc dkg round1 --help`,
+/// `zmpc --help` and `zmpc --help dkg` all count. A null topic means the
+/// overview.
+fn helpRequest(args: *Args) ?struct { topic: ?[]const u8 } {
+    const first = args.word(0);
+    if (first) |w| {
+        if (eql(w, "help")) return .{ .topic = args.word(1) orelse args.value("help") };
+        // `--help` alongside a command asks about that command, whatever else
+        // is on the line.
+        if (args.has("help")) return .{ .topic = w };
+        return null;
+    }
+    if (args.has("help")) return .{ .topic = args.value("help") };
+    return null;
+}
+
+fn showHelp(ctx: *cmd.Ctx, topic: ?[]const u8) !u8 {
+    const name = topic orelse "help";
+    // `zmpc help help` and `zmpc help version`-style requests for the tool
+    // itself land on the overview rather than on nothing.
+    if (eql(name, "help") or eql(name, "zmpc")) {
+        try ctx.out.writeAll(help.overview);
+        return cmd.Exit.ok;
+    }
+    if (help.page(name)) |text| {
+        try ctx.out.writeAll(text);
+        try ctx.out.writeAll("\n");
+        return cmd.Exit.ok;
+    }
+    try ctx.warn("no help for '{s}'\n", .{name});
+    try help.writeTopicList(ctx.err);
+    return cmd.Exit.usage;
+}
+
+/// Where this command's session lives: `--dir` if given, else `ZMPC_DIR`,
+/// else the current directory.
+fn sessionDir(ctx: *cmd.Ctx, args: *Args) []const u8 {
+    return sessionLocation(ctx, args) orelse ".";
+}
+
+/// The same, but null when neither was given. Commands that *create* a
+/// session use this: writing five entries into whatever directory someone
+/// happened to be in is not a good default.
+fn sessionLocation(ctx: *cmd.Ctx, args: *Args) ?[]const u8 {
+    return args.value("dir") orelse ctx.dir_from_env;
+}
+
+/// Refuse to create a session without being told where. Returns the location,
+/// or prints the reason and the command's page.
+fn requireLocation(ctx: *cmd.Ctx, args: *Args, command: []const u8) !?[]const u8 {
+    return sessionLocation(ctx, args) orelse {
+        try ctx.warn(
+            "say where to create the session, so that this does not scatter\n" ++
+                "session files into the current directory:\n" ++
+                "  --dir party1      create it there\n" ++
+                "  --dir .           create it right here, if that is what you want\n" ++
+                "  ZMPC_DIR=party1   export it once and every command uses it\n\n",
+            .{},
+        );
+        _ = try cmd.usagePage(ctx.*, command);
+        return null;
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -219,7 +248,9 @@ fn cmdInit(ctx: *cmd.Ctx, args: *Args) !u8 {
         break :blk try session.hexId(ctx.gpa, id);
     };
 
-    const s = session.Session.create(ctx.env(), sessionDir(args), .{
+    const dir = try requireLocation(ctx, args, "init") orelse
+        return cmd.Exit.usage;
+    const s = session.Session.create(ctx.env(), dir, .{
         .session = id_hex,
         .protocol = @tagName(protocol),
         .suite = suite_name,
@@ -228,7 +259,7 @@ fn cmdInit(ctx: *cmd.Ctx, args: *Args) !u8 {
         .threshold = threshold,
     }) catch |e| switch (e) {
         error.SessionExists => {
-            try ctx.warn("a session already exists in '{s}'\n", .{sessionDir(args)});
+            try ctx.warn("a session already exists in '{s}'\n", .{dir});
             return cmd.Exit.usage;
         },
         else => return e,
@@ -259,12 +290,19 @@ fn cmdStatus(ctx: *cmd.Ctx, args: *Args) !u8 {
     const reqs = try session.requirements(ctx.gpa, s.protocol, next_round, try s.participants(), m.party);
     const missing = try inbox.missing(reqs);
 
+    // The step someone would type next, if the protocol has one left.
+    const step: ?[]const u8 = if (m.complete) null else session.stepName(s.protocol, next_round);
+
     if (ctx.json) {
+        // `next_step` is the bare subcommand, not a whole command line: a
+        // script knows its own --dir, and a path here would need escaping.
         try ctx.emit(
             "{{\"session\":\"{s}\",\"protocol\":\"{s}\",\"suite\":\"{s}\",\"party\":{d}," ++
-                "\"threshold\":{d},\"parties\":{d},\"round\":{d},\"complete\":{},\"waiting_on\":{d}}}\n",
+                "\"threshold\":{d},\"parties\":{d},\"round\":{d},\"complete\":{}," ++
+                "\"waiting_on\":{d},\"next_step\":",
             .{ m.session, m.protocol, m.suite, m.party, m.threshold, m.n_parties, m.round, m.complete, missing.len },
         );
+        if (step) |name| try ctx.emit("\"{s}\"}}\n", .{name}) else try ctx.emit("null}}\n", .{});
         return cmd.Exit.ok;
     }
 
@@ -274,16 +312,49 @@ fn cmdStatus(ctx: *cmd.Ctx, args: *Args) !u8 {
     try ctx.emit("inbox     {d} frame(s)\n", .{inbox.frames.len});
     if (m.complete) {
         try ctx.emit("state     complete\n", .{});
+        try ctx.emit("next      nothing - this session is finished\n", .{});
         return cmd.Exit.ok;
     }
-    try ctx.emit("state     {d} round(s) done; next is round {d}\n", .{ m.round, next_round });
+    try ctx.emit("state     {d} round(s) done\n", .{m.round});
+    if (step) |name| {
+        try ctx.emit("next      zmpc {s} {s}{s}\n", .{ m.protocol, name, try dirSuffix(ctx, args) });
+    } else {
+        try ctx.emit("next      round {d}\n", .{next_round});
+    }
     if (missing.len == 0) {
-        try ctx.emit("ready     yes - run the next round\n", .{});
+        try ctx.emit("ready     yes - run it now\n", .{});
         return cmd.Exit.ok;
     }
-    try ctx.emit("ready     no\n", .{});
+    try ctx.emit("ready     no - deliver the frames below first\n", .{});
     _ = try cmd.reportMissingWith(ctx.*, missing, inbox.rejected);
     return cmd.Exit.ok;
+}
+
+/// The ` --dir X` to append to a suggested command, so it can be pasted as
+/// shown. Empty when `--dir` was not given: the location then came from
+/// ZMPC_DIR or the current directory, both of which still apply to the next
+/// command as typed.
+fn dirSuffix(ctx: *cmd.Ctx, args: *Args) ![]const u8 {
+    const dir = args.value("dir") orelse return "";
+    return std.fmt.allocPrint(ctx.gpa, " --dir {s}", .{try shellQuote(ctx.gpa, dir)});
+}
+
+/// Single-quote `text` if a shell would otherwise mangle it, so a suggested
+/// command can be pasted exactly as printed.
+fn shellQuote(gpa: std.mem.Allocator, text: []const u8) ![]const u8 {
+    const needs_quoting = text.len == 0 or
+        std.mem.indexOfAny(u8, text, " \t\n'\"\\$`*?[]{}()&;|<>!#~") != null;
+    if (!needs_quoting) return text;
+
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(gpa, '\'');
+    for (text) |c| {
+        // A single quote cannot appear inside single quotes; close, escape it,
+        // and reopen.
+        if (c == '\'') try out.appendSlice(gpa, "'\\''") else try out.append(gpa, c);
+    }
+    try out.append(gpa, '\'');
+    return out.toOwnedSlice(gpa);
 }
 
 /// Read a key share's shape from its *payload*, and cross-check the header
@@ -350,11 +421,11 @@ fn rejectBadSignerSet(ctx: *cmd.Ctx, signers: []u16, shape: ShareShape) !?u8 {
 }
 
 fn openSession(ctx: *cmd.Ctx, args: *Args) !session.Session {
-    return session.Session.open(ctx.env(), sessionDir(args)) catch |e| switch (e) {
+    return session.Session.open(ctx.env(), sessionDir(ctx, args)) catch |e| switch (e) {
         error.SessionNotFound => {
             try ctx.warn(
                 "no session in '{s}' - run `zmpc init` there first\n",
-                .{sessionDir(args)},
+                .{sessionDir(ctx, args)},
             );
             return error.Reported;
         },
@@ -368,10 +439,7 @@ fn openSession(ctx: *cmd.Ctx, args: *Args) !session.Session {
 
 fn cmdDkg(ctx: *cmd.Ctx, args: *Args) !u8 {
     try args.rejectUnknown(&.{ "dir", "armor", "json", "quiet" });
-    const step = args.word(1) orelse {
-        try ctx.warn("usage: zmpc dkg <round1|round2|round3|finalize|run> [--dir DIR]\n", .{});
-        return cmd.Exit.usage;
-    };
+    const step = args.word(1) orelse return cmd.usagePage(ctx.*, "dkg");
 
     var s = try openSession(ctx, args);
     if (s.protocol != .dkg) {
@@ -380,15 +448,7 @@ fn cmdDkg(ctx: *cmd.Ctx, args: *Args) !u8 {
     }
 
     if (eql(step, "run")) return dkg.runAll(ctx.*, &s);
-    const round: u16 = if (eql(step, "round1"))
-        1
-    else if (eql(step, "round2"))
-        2
-    else if (eql(step, "round3"))
-        3
-    else if (eql(step, "finalize"))
-        4
-    else {
+    const round = roundOfStep(.dkg, step) orelse {
         try ctx.warn("unknown dkg step '{s}'\n", .{step});
         return cmd.Exit.usage;
     };
@@ -419,13 +479,7 @@ fn cmdDkg(ctx: *cmd.Ctx, args: *Args) !u8 {
 // ---------------------------------------------------------------------------
 
 fn cmdAuxgen(ctx: *cmd.Ctx, args: *Args) !u8 {
-    const step = args.word(1) orelse {
-        try ctx.warn(
-            "usage: zmpc auxgen <primes|round1|round2|round3|finalize|run> [--dir DIR]\n",
-            .{},
-        );
-        return cmd.Exit.usage;
-    };
+    const step = args.word(1) orelse return cmd.usagePage(ctx.*, "auxgen");
 
     if (eql(step, "primes")) {
         try args.rejectUnknown(&.{ "suite", "out", "json", "quiet", "armor", "dir" });
@@ -446,7 +500,7 @@ fn cmdAuxgen(ctx: *cmd.Ctx, args: *Args) !u8 {
     const primes_path = args.value("primes");
     if (eql(step, "run")) return auxgen.runAll(ctx.*, &s, primes_path);
 
-    const round = roundOf(step, "round1", "round2", "round3", "finalize") orelse {
+    const round = roundOfStep(.auxgen, step) orelse {
         try ctx.warn("unknown auxgen step '{s}'\n", .{step});
         return cmd.Exit.usage;
     };
@@ -459,13 +513,7 @@ fn cmdAuxgen(ctx: *cmd.Ctx, args: *Args) !u8 {
 // ---------------------------------------------------------------------------
 
 fn cmdPresign(ctx: *cmd.Ctx, args: *Args) !u8 {
-    const step = args.word(1) orelse {
-        try ctx.warn(
-            "usage: zmpc presign <init|round1|round2|round3|finalize|run> [--dir DIR]\n",
-            .{},
-        );
-        return cmd.Exit.usage;
-    };
+    const step = args.word(1) orelse return cmd.usagePage(ctx.*, "presign");
 
     if (eql(step, "init")) return cmdPresignInit(ctx, args);
 
@@ -478,7 +526,7 @@ fn cmdPresign(ctx: *cmd.Ctx, args: *Args) !u8 {
     const paths = ecdsa.Paths{ .share = args.value("share"), .aux = args.value("aux") };
     if (eql(step, "run")) return ecdsa.runAll(ctx.*, &s, paths);
 
-    const round = roundOf(step, "round1", "round2", "round3", "finalize") orelse {
+    const round = roundOfStep(.presign, step) orelse {
         try ctx.warn("unknown presign step '{s}'\n", .{step});
         return cmd.Exit.usage;
     };
@@ -536,7 +584,9 @@ fn cmdPresignInit(ctx: *cmd.Ctx, args: *Args) !u8 {
         return cmd.Exit.usage;
     }
 
-    const s = session.Session.create(ctx.env(), sessionDir(args), .{
+    const dir = try requireLocation(ctx, args, "presign") orelse
+        return cmd.Exit.usage;
+    const s = session.Session.create(ctx.env(), dir, .{
         .session = id_hex,
         .protocol = "presign",
         .suite = @tagName(f.header.suite),
@@ -548,7 +598,7 @@ fn cmdPresignInit(ctx: *cmd.Ctx, args: *Args) !u8 {
         .aux_path = aux_path,
     }) catch |e| switch (e) {
         error.SessionExists => {
-            try ctx.warn("a session already exists in '{s}'\n", .{sessionDir(args)});
+            try ctx.warn("a session already exists in '{s}'\n", .{dir});
             return cmd.Exit.usage;
         },
         else => return e,
@@ -567,10 +617,7 @@ fn cmdPresignInit(ctx: *cmd.Ctx, args: *Args) !u8 {
 // ---------------------------------------------------------------------------
 
 fn cmdEcdsa(ctx: *cmd.Ctx, args: *Args) !u8 {
-    const action = args.word(1) orelse {
-        try ctx.warn("usage: zmpc ecdsa <sign|combine|verify> [options]\n", .{});
-        return cmd.Exit.usage;
-    };
+    const action = args.word(1) orelse return cmd.usagePage(ctx.*, "ecdsa");
 
     if (eql(action, "sign")) {
         try args.rejectUnknown(&.{
@@ -647,18 +694,15 @@ fn digestFromArgs(ctx: *cmd.Ctx, args: *Args) ![32]u8 {
     return ecdsa.digestOf(ctx.*, msg, null);
 }
 
-/// Shared "which round is this" mapping and ordering guard.
-fn roundOf(
-    step: []const u8,
-    comptime a: []const u8,
-    comptime b: []const u8,
-    comptime c: []const u8,
-    comptime d: []const u8,
-) ?u16 {
-    if (eql(step, a)) return 1;
-    if (eql(step, b)) return 2;
-    if (eql(step, c)) return 3;
-    if (eql(step, d)) return 4;
+/// Which round a subcommand runs: the inverse of `session.stepName`, which
+/// is where the names live. Going through one table in both directions is
+/// what stops `zmpc status` from ever suggesting a step this would reject.
+fn roundOfStep(protocol: frame.Protocol, step: []const u8) ?u16 {
+    var round: u16 = 1;
+    while (round <= session.max_rounds) : (round += 1) {
+        const name = session.stepName(protocol, round) orelse continue;
+        if (eql(step, name)) return round;
+    }
     return null;
 }
 
@@ -691,13 +735,7 @@ fn guardRound(ctx: *cmd.Ctx, s: *session.Session, round: u16, step: []const u8) 
 // ---------------------------------------------------------------------------
 
 fn cmdSign(ctx: *cmd.Ctx, args: *Args) !u8 {
-    const step = args.word(1) orelse {
-        try ctx.warn(
-            "usage: zmpc sign <init|commit|share|aggregate|run> [--dir DIR]\n",
-            .{},
-        );
-        return cmd.Exit.usage;
-    };
+    const step = args.word(1) orelse return cmd.usagePage(ctx.*, "sign");
 
     if (eql(step, "init")) return cmdSignInit(ctx, args);
 
@@ -710,13 +748,7 @@ fn cmdSign(ctx: *cmd.Ctx, args: *Args) !u8 {
     const share_override = args.value("share");
     if (eql(step, "run")) return sign.runAll(ctx.*, &s, share_override);
 
-    const round: u16 = if (eql(step, "commit"))
-        1
-    else if (eql(step, "share"))
-        2
-    else if (eql(step, "aggregate"))
-        3
-    else {
+    const round = roundOfStep(.sign, step) orelse {
         try ctx.warn("unknown sign step '{s}'\n", .{step});
         return cmd.Exit.usage;
     };
@@ -802,7 +834,9 @@ fn cmdSignInit(ctx: *cmd.Ctx, args: *Args) !u8 {
         return cmd.Exit.usage;
     }
 
-    var s = session.Session.create(ctx.env(), sessionDir(args), .{
+    const dir = try requireLocation(ctx, args, "sign") orelse
+        return cmd.Exit.usage;
+    var s = session.Session.create(ctx.env(), dir, .{
         .session = id_hex,
         .protocol = "sign",
         .suite = @tagName(f.header.suite),
@@ -813,7 +847,7 @@ fn cmdSignInit(ctx: *cmd.Ctx, args: *Args) !u8 {
         .share_path = share_path,
     }) catch |e| switch (e) {
         error.SessionExists => {
-            try ctx.warn("a session already exists in '{s}'\n", .{sessionDir(args)});
+            try ctx.warn("a session already exists in '{s}'\n", .{dir});
             return cmd.Exit.usage;
         },
         else => return e,
@@ -875,8 +909,11 @@ fn cmdRelay(ctx: *cmd.Ctx, args: *Args) !u8 {
 
 fn cmdPush(ctx: *cmd.Ctx, args: *Args) !u8 {
     try args.rejectUnknown(&.{ "dir", "relay", "json", "quiet", "armor" });
+    // Check the options before the session: how the command is used is a
+    // question this binary can always answer, whatever directory it is in.
+    const addr = try args.require("relay");
     var s = try openSession(ctx, args);
-    const count = try relay.push(ctx.*, &s, try args.require("relay"));
+    const count = try relay.push(ctx.*, &s, addr);
     try ctx.note("pushed {d} frame(s)\n", .{count});
     if (ctx.json) try ctx.emit("{{\"pushed\":{d}}}\n", .{count});
     return cmd.Exit.ok;
@@ -884,8 +921,9 @@ fn cmdPush(ctx: *cmd.Ctx, args: *Args) !u8 {
 
 fn cmdPull(ctx: *cmd.Ctx, args: *Args) !u8 {
     try args.rejectUnknown(&.{ "dir", "relay", "json", "quiet", "armor" });
+    const addr = try args.require("relay");
     var s = try openSession(ctx, args);
-    const count = try relay.pull(ctx.*, &s, try args.require("relay"));
+    const count = try relay.pull(ctx.*, &s, addr);
     try ctx.note("pulled {d} frame(s)\n", .{count});
     if (ctx.json) try ctx.emit("{{\"pulled\":{d}}}\n", .{count});
     return cmd.Exit.ok;
@@ -898,11 +936,11 @@ fn cmdNode(ctx: *cmd.Ctx, args: *Args) !u8 {
         "dir",  "relay", "share", "aux", "primes", "poll-ms", "timeout-s",
         "json", "quiet", "armor",
     });
-    var s = try openSession(ctx, args);
     const relay_addr = try args.require("relay");
-    ctx.polling = true;
     const poll_ms = (try args.int(u32, "poll-ms")) orelse 500;
     const timeout_s = (try args.int(u32, "timeout-s")) orelse 600;
+    var s = try openSession(ctx, args);
+    ctx.polling = true;
 
     const paths = ecdsa.Paths{ .share = args.value("share"), .aux = args.value("aux") };
     var waited_ms: u64 = 0;
@@ -950,13 +988,7 @@ fn cmdNode(ctx: *cmd.Ctx, args: *Args) !u8 {
 // ---------------------------------------------------------------------------
 
 fn cmdRefresh(ctx: *cmd.Ctx, args: *Args) !u8 {
-    const step = args.word(1) orelse {
-        try ctx.warn(
-            "usage: zmpc refresh <init|round1|round2|finalize|run> [--dir DIR]\n",
-            .{},
-        );
-        return cmd.Exit.usage;
-    };
+    const step = args.word(1) orelse return cmd.usagePage(ctx.*, "refresh");
 
     if (eql(step, "init")) return cmdRefreshInit(ctx, args);
 
@@ -969,13 +1001,7 @@ fn cmdRefresh(ctx: *cmd.Ctx, args: *Args) !u8 {
     const share_override = args.value("share");
     if (eql(step, "run")) return refresh.runAll(ctx.*, &s, share_override);
 
-    const round: u16 = if (eql(step, "round1"))
-        1
-    else if (eql(step, "round2"))
-        2
-    else if (eql(step, "finalize"))
-        3
-    else {
+    const round = roundOfStep(.refresh, step) orelse {
         try ctx.warn("unknown refresh step '{s}'\n", .{step});
         return cmd.Exit.usage;
     };
@@ -1011,7 +1037,9 @@ fn cmdRefreshInit(ctx: *cmd.Ctx, args: *Args) !u8 {
     const shape = try shareShape(ctx, f);
     const party = shape.party;
 
-    const s = session.Session.create(ctx.env(), sessionDir(args), .{
+    const dir = try requireLocation(ctx, args, "refresh") orelse
+        return cmd.Exit.usage;
+    const s = session.Session.create(ctx.env(), dir, .{
         .session = id_hex,
         .protocol = "refresh",
         .suite = @tagName(f.header.suite),
@@ -1021,7 +1049,7 @@ fn cmdRefreshInit(ctx: *cmd.Ctx, args: *Args) !u8 {
         .share_path = share_path,
     }) catch |e| switch (e) {
         error.SessionExists => {
-            try ctx.warn("a session already exists in '{s}'\n", .{sessionDir(args)});
+            try ctx.warn("a session already exists in '{s}'\n", .{dir});
             return cmd.Exit.usage;
         },
         else => return e,
@@ -1041,13 +1069,7 @@ fn cmdRefreshInit(ctx: *cmd.Ctx, args: *Args) !u8 {
 
 fn cmdHd(ctx: *cmd.Ctx, args: *Args) !u8 {
     try args.rejectUnknown(&.{ "share", "path", "out", "dir", "json", "quiet", "armor" });
-    const action = args.word(1) orelse {
-        try ctx.warn(
-            "usage: zmpc hd <pubkey|derive> --share FILE --path m/44/0/7 [--out FILE]\n",
-            .{},
-        );
-        return cmd.Exit.usage;
-    };
+    const action = args.word(1) orelse return cmd.usagePage(ctx.*, "hd");
 
     const share_path = if (args.value("share")) |p| p else blk: {
         var s = try openSession(ctx, args);
@@ -1074,10 +1096,7 @@ fn cmdHd(ctx: *cmd.Ctx, args: *Args) !u8 {
 
 fn cmdShare(ctx: *cmd.Ctx, args: *Args) !u8 {
     try args.rejectUnknown(&.{ "dir", "share", "json", "quiet", "armor" });
-    const action = args.word(1) orelse {
-        try ctx.warn("usage: zmpc share <info|pubkey|verify> [--share FILE | --dir DIR]\n", .{});
-        return cmd.Exit.usage;
-    };
+    const action = args.word(1) orelse return cmd.usagePage(ctx.*, "share");
 
     const path = if (args.value("share")) |p| p else blk: {
         var s = try openSession(ctx, args);
@@ -1171,10 +1190,7 @@ fn shareFor(comptime E: type, ctx: *cmd.Ctx, f: frame.Frame, action: []const u8)
 
 fn cmdInspect(ctx: *cmd.Ctx, args: *Args) !u8 {
     try args.rejectUnknown(&.{ "json", "quiet", "armor", "dir" });
-    const path = args.word(1) orelse {
-        try ctx.warn("usage: zmpc inspect <file>\n", .{});
-        return cmd.Exit.usage;
-    };
+    const path = args.word(1) orelse return cmd.usagePage(ctx.*, "inspect");
 
     const f = cmd.readFrame(ctx.*, path) catch |e| {
         try ctx.warn("cannot read frame '{s}': {t}\n", .{ path, e });
@@ -1252,6 +1268,7 @@ test {
     _ = cmd;
     _ = frame;
     _ = hd;
+    _ = help;
     _ = session;
     _ = suite_mod;
 }

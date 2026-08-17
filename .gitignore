@@ -1,6 +1,10 @@
 .zig-cache/
 zig-out/
 
+# Package cache for dependencies from build.zig.zon (snap zig extracts
+# packages next to the project instead of into the global cache).
+zig-pkg/
+
 # Autodoc from `zig build-lib -femit-docs`. Mostly a sources.tar that
 # duplicates the tree it was generated from, so committing it would put a
 # second copy of the repo in the repo.
@@ -12,3 +16,5 @@ docs/
 
 # Default spool for `zmpc relay`, if it is run from the repo root.
 zmpc-spool/
+
+party*/

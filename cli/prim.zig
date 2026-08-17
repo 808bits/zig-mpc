@@ -62,10 +62,7 @@ fn printBig(ctx: cmd.Ctx, value: Big.Bytes) !u8 {
 // ---------------------------------------------------------------------------
 
 pub fn bip340(ctx: cmd.Ctx, args: *Args) !u8 {
-    const action = args.word(1) orelse {
-        try ctx.warn("usage: zmpc bip340 <pubkey|sign|verify> [options]\n", .{});
-        return cmd.Exit.usage;
-    };
+    const action = args.word(1) orelse return cmd.usagePage(ctx, "bip340");
     try args.rejectUnknown(&.{
         "sk", "pubkey", "msg-file", "msg-hex", "aux", "sig", "json", "quiet", "armor", "dir",
     });
@@ -161,17 +158,13 @@ pub fn bip340(ctx: cmd.Ctx, args: *Args) !u8 {
 const paillier_sizes = [_]comptime_int{ 128, 256, 512, 1024 };
 
 pub fn paillier(ctx: cmd.Ctx, args: *Args) !u8 {
-    const action = args.word(1) orelse {
-        try ctx.warn(
-            "usage: zmpc paillier <keygen|encrypt|decrypt|add|mul|addplain> [options]\n" ++
-                "       moduli are 2x the prime size; --bits is the prime size\n",
-            .{},
-        );
-        return cmd.Exit.usage;
-    };
+    const action = args.word(1) orelse return cmd.usagePage(ctx, "paillier");
+    // The primes come from a `--key` file's `p:` and `q:` lines, never from
+    // flags: a secret on the command line ends up in the shell history and in
+    // every process listing on the machine.
     try args.rejectUnknown(&.{
         "bits", "key",  "n",     "m",     "r",   "c", "c2", "k",
-        "out",  "json", "quiet", "armor", "dir", "p", "q",
+        "out",  "json", "quiet", "armor", "dir",
     });
 
     const bits = (try args.int(u16, "bits")) orelse 512;
@@ -339,13 +332,7 @@ fn paillierFor(comptime prime_bits: comptime_int, ctx: cmd.Ctx, args: *Args, act
 // ---------------------------------------------------------------------------
 
 pub fn vss(ctx: cmd.Ctx, args: *Args) !u8 {
-    const action = args.word(1) orelse {
-        try ctx.warn(
-            "usage: zmpc vss <split|reconstruct|verify> --curve C [options]\n",
-            .{},
-        );
-        return cmd.Exit.usage;
-    };
+    const action = args.word(1) orelse return cmd.usagePage(ctx, "vss");
     try args.rejectUnknown(&.{
         "curve", "secret", "t",     "n",   "shares", "commitment", "index", "share",
         "json",  "quiet",  "armor", "dir",
@@ -485,13 +472,7 @@ fn vssFor(comptime E: type, ctx: cmd.Ctx, args: *Args, action: []const u8) !u8 {
 // ---------------------------------------------------------------------------
 
 pub fn ffx(ctx: cmd.Ctx, args: *Args) !u8 {
-    const action = args.word(1) orelse {
-        try ctx.warn(
-            "usage: zmpc ffx <prime|isprime|jacobi|gcd|inverse|sqrt|divrem> [options]\n",
-            .{},
-        );
-        return cmd.Exit.usage;
-    };
+    const action = args.word(1) orelse return cmd.usagePage(ctx, "ffx");
     try args.rejectUnknown(&.{
         "bits", "blum", "safe", "a", "b", "n", "m", "json", "quiet", "armor", "dir",
     });
@@ -585,10 +566,7 @@ pub fn ffx(ctx: cmd.Ctx, args: *Args) !u8 {
 
 pub fn transcript(ctx: cmd.Ctx, args: *Args) !u8 {
     const action = args.word(1) orelse "hash";
-    if (!eql(action, "hash")) {
-        try ctx.warn("usage: zmpc transcript hash --domain D [--append label=hex ...]\n", .{});
-        return cmd.Exit.usage;
-    }
+    if (!eql(action, "hash")) return cmd.usagePage(ctx, "transcript");
     try args.rejectUnknown(&.{ "domain", "append", "u64", "bytes", "json", "quiet", "armor", "dir" });
 
     // The domain is a compile-time constant in the library (it is a domain

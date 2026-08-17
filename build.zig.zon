@@ -3,7 +3,12 @@
     .version = "0.0.1",
     .fingerprint = 0xf978ab47dd239878, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .secp256k1 = .{
+            .url = "https://github.com/bitcoin-core/secp256k1/archive/refs/tags/v0.8.0.tar.gz",
+            .hash = "N-V-__8AAFwQbQAc-L8ZUw4rqyk_OWdYX4-V8crqiWlJ1dhl",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

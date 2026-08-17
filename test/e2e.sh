@@ -70,6 +70,58 @@ say "self-test (known-answer vectors through this binary)"
 if "$ZMPC" selftest --quiet >/dev/null; then ok "vectors"; else fail "selftest"; fi
 
 # --------------------------------------------------------------------------
+say "help"
+
+# A command given too little to act on prints its whole page, not just the
+# first thing it missed, and prints it to stderr so stdout stays capturable.
+out=$("$ZMPC" init 2>/dev/null || true)
+err=$("$ZMPC" init 2>&1 >/dev/null || true)
+set +e; "$ZMPC" init >/dev/null 2>&1; code=$?; set -e
+same "a command with no options exits 2" "$code" "2"
+[ -z "$out" ] && ok "nothing on stdout" || fail "usage text went to stdout"
+case "$err" in
+  *"missing required option '--suite'"*"--threshold N"*"--session HEX"*)
+    ok "stderr names the missing option, then lists every option" ;;
+  *) printf '   %s\n' "$err" >&2; fail "no full page on stderr" ;;
+esac
+
+# The same page, asked for deliberately, goes to stdout and is not an error.
+set +e; "$ZMPC" help init >/dev/null 2>&1; code=$?; set -e
+same "asking for help is not an error" "$code" "0"
+same "init --help and help init agree" \
+     "$("$ZMPC" init --help)" "$("$ZMPC" help init)"
+
+# A missing step behaves the same way as a missing option.
+case "$("$ZMPC" dkg 2>&1 >/dev/null || true)" in
+  *"round1"*"finalize"*) ok "a command with no step prints its page" ;;
+  *) fail "no page for a bare subcommand" ;;
+esac
+
+# --------------------------------------------------------------------------
+say "session location"
+
+# Creating a session without saying where must refuse, and must not leave
+# anything behind in the current directory.
+mkdir scatter && cd scatter
+set +e
+"$ZMPC" init --suite ed25519 --party 1 --n 3 --threshold 2 >/dev/null 2>&1
+code=$?
+set -e
+same "init without --dir exits 2" "$code" "2"
+[ ! -e session.json ] && [ ! -d in ] && ok "nothing scattered into the cwd" \
+  || fail "init wrote into the current directory"
+
+# ZMPC_DIR stands in for --dir, for every command, and --dir still wins.
+ZMPC_DIR=envparty "$ZMPC" init --suite ed25519 --party 1 --n 3 --threshold 2 --quiet >/dev/null
+[ -f envparty/session.json ] && ok "ZMPC_DIR satisfies init" || fail "ZMPC_DIR ignored by init"
+same "ZMPC_DIR drives later commands too" \
+     "$(ZMPC_DIR=envparty "$ZMPC" status --json | sed -n 's/.*"party":\([0-9]*\).*/\1/p')" "1"
+"$ZMPC" init --dir flagparty --suite ed25519 --party 2 --n 3 --threshold 2 --quiet >/dev/null
+same "--dir wins over ZMPC_DIR" \
+     "$(ZMPC_DIR=envparty "$ZMPC" status --dir flagparty --json | sed -n 's/.*"party":\([0-9]*\).*/\1/p')" "2"
+cd ..
+
+# --------------------------------------------------------------------------
 say "2-of-3 distributed key generation, three processes (ed25519)"
 SID=$("$ZMPC" init --dir p1 --suite ed25519 --party 1 --n 3 --threshold 2 --quiet)
 for i in 2 3; do
@@ -77,8 +129,25 @@ for i in 2 3; do
       --session "$SID" --quiet >/dev/null
 done
 
+# `status` names the command to run next, ready to paste.
+same "status suggests the first command" \
+     "$("$ZMPC" status --dir p1 | sed -n 's/^next  *//p')" "zmpc dkg round1 --dir p1"
+
 # A round before its inputs arrive must report "waiting", not fail.
 "$ZMPC" dkg round1 --dir p1 --quiet >/dev/null
+
+same "status advances to the next command" \
+     "$("$ZMPC" status --dir p1 | sed -n 's/^next  *//p')" "zmpc dkg round2 --dir p1"
+same "and names it for scripts too" \
+     "$("$ZMPC" status --dir p1 --json | sed -n 's/.*"next_step":"\([a-z0-9]*\)".*/\1/p')" "round2"
+
+# What it suggests must be a command the CLI actually accepts: run it (it
+# will report "waiting", which is exit 75, not a usage error).
+set +e
+$("$ZMPC" status --dir p1 | sed -n 's/^next  *zmpc //p' | sed "s|^|$ZMPC |") --quiet >/dev/null 2>&1
+code=$?
+set -e
+same "the suggested command is runnable" "$code" "75"
 set +e; "$ZMPC" dkg round2 --dir p1 >/dev/null 2>&1; code=$?; set -e
 [ "$code" = "75" ] && ok "waiting on peers exits 75" || fail "expected exit 75, got $code"
 "$ZMPC" dkg round1 --dir p2 --quiet >/dev/null

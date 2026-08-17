@@ -4,6 +4,7 @@
 const std = @import("std");
 const mpc = @import("zig_mpc");
 const frame = @import("frame.zig");
+const help = @import("help.zig");
 const session = @import("session.zig");
 
 const Allocator = std.mem.Allocator;
@@ -27,6 +28,10 @@ pub const Ctx = struct {
     out: *std.Io.Writer,
     err: *std.Io.Writer,
     rng: std.Random,
+    /// `ZMPC_DIR`, if it is set to something non-empty: the session directory
+    /// to use when `--dir` is absent. Set it once per shell and every command
+    /// for that party gets shorter.
+    dir_from_env: ?[]const u8 = null,
     /// Write frames as base64 text rather than binary.
     armor: bool = false,
     /// Machine-readable output on stdout; human text goes to stderr.
@@ -57,6 +62,22 @@ pub const Ctx = struct {
         try self.err.print(fmt, args);
     }
 };
+
+/// Print a command's whole help page and return the usage exit code.
+///
+/// Reached whenever a command was given too little to act on: no step, or a
+/// missing, misspelled or malformed option. Someone in that position wants to
+/// see every option, not to rediscover them one error at a time, so this
+/// prints the same page `zmpc <command> --help` does. It goes to stderr,
+/// because it accompanies a failure and must not land in output a script is
+/// capturing.
+pub fn usagePage(ctx: Ctx, command: []const u8) !u8 {
+    if (help.page(command)) |text| {
+        try ctx.err.writeAll(text);
+        try ctx.err.writeAll("\n");
+    }
+    return Exit.usage;
+}
 
 /// Decode hex into a fixed-size buffer, requiring exactly `out.len` bytes.
 ///

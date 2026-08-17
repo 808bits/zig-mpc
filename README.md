@@ -46,8 +46,24 @@ zmpc sign aggregate --dir s1        # writes artifacts/signature.bin
 zmpc verify --suite ed25519 --pubkey <hex> --msg-file tx.bin --sig signature.bin
 ```
 
-`zmpc --help` lists every command. `zig build cli -- <args>` runs it from the
-source tree; `zig build` installs it to `zig-out/bin/zmpc`.
+Creating a session needs an explicit `--dir`, so that `zmpc init` never
+scatters `session.json`, `in/`, `out/`, `state/` and `artifacts/` into
+whatever directory you were standing in; pass `--dir .` if you do mean here.
+Every other command defaults `--dir` to `.`. To drive several parties from
+one directory without repeating the flag, export `ZMPC_DIR` in a shell per
+party:
+
+```
+export ZMPC_DIR=party1
+zmpc init --suite ed25519 --party 1 --n 3 --threshold 2
+zmpc dkg run                  # no --dir needed; --dir still wins if given
+```
+
+`zmpc help` lists every command and the order they run in.
+`zmpc help <command>`, or equivalently `zmpc <command> --help`, documents
+every option that command takes; `zmpc help suites` explains which suite to
+pick and `zmpc help exit` what each exit code means. `zig build cli -- <args>`
+runs it from the source tree; `zig build` installs it to `zig-out/bin/zmpc`.
 
 ### How the processes talk
 
@@ -92,10 +108,13 @@ Four options are accepted by every command:
 
 | option | meaning |
 |---|---|
-| `--dir DIR` | the session directory to operate on (default: `.`) |
+| `--dir DIR` | the session directory to operate on (default: `$ZMPC_DIR`, else `.`; required when creating a session) |
 | `--armor` | write frames as base64 text (`.zmpc.asc`) instead of binary |
 | `--json` | machine-readable result on stdout, human text on stderr |
 | `--quiet` | suppress progress notes |
+
+`ZMPC_DIR` is the only environment variable zmpc reads: it supplies `--dir`
+when the flag is absent, so one shell per party can drop the flag entirely.
 
 Exit codes: `0` success, `1` internal error, `2` usage error, `64` unreadable
 or malformed input, `65` protocol abort (bad proof, share, or signature),
@@ -111,12 +130,22 @@ or malformed input, `65` protocol abort (bad proof, share, or signature),
 | `--party I` | required; this party's index, `1..n` |
 | `--n N` | required; how many parties in total (at least 2) |
 | `--threshold T` | required; how many are needed to sign, `1..n` |
+| `--dir D` | required; where to create the session (`--dir .` for here). `ZMPC_DIR` satisfies it too |
 | `--protocol P` | `dkg` (default) or `auxgen`; `refresh`, `presign` and `sign` sessions are created by their own `init` subcommands instead |
 | `--session HEX` | the 64-hex run id printed by the first party's `init`; omit to mint a new one |
 
 **`zmpc status`** - report this session's round progress, inbox contents, and
-exactly which frames the next round is still waiting for. No options beyond
-the common four.
+exactly which frames the next round is still waiting for. The `next` line
+spells out the command to run, ready to paste:
+
+```
+state     1 round(s) done
+next      zmpc dkg round2 --dir p1
+ready     no - deliver the frames below first
+```
+
+Under `--json` the same thing appears as `"next_step":"round2"`, or `null`
+once the session is complete. No options beyond the common four.
 
 #### Protocol rounds
 
@@ -304,7 +333,7 @@ skips the live protocol runs.
 **`zmpc inspect FILE`** - decode any frame's header: kind, protocol, round,
 sender, recipient, session, payload size.
 
-**`zmpc version`**, **`zmpc help`**.
+**`zmpc version`**, **`zmpc help [command|suites|exit]`**.
 
 ### Example ceremony: a 2-of-3 ECDSA key over TCP
 
@@ -541,9 +570,21 @@ test/
   e2e.sh          multi-process end-to-end run, one process per party
   ceremony.js     JS wrapper over the wasm exports
   smoke.mjs       full ceremony through the wasm module under node
+  interop.zig     cross-checks against bitcoin-core/libsecp256k1
 ```
 
 `zig build test` runs the full suite. Pinned to Zig 0.16.0.
+
+The interop tests (`zig build interop`, also part of `zig build test`)
+verify the same signatures against a second independent implementation:
+[bitcoin-core/secp256k1](https://github.com/bitcoin-core/secp256k1),
+fetched as a package and compiled from source. A CGGMP24 threshold ECDSA
+signature and a FROST-Taproot threshold Schnorr signature must verify
+under libsecp256k1; libsecp256k1's ECDSA and BIP-340 signatures must
+verify under this library; and on the official BIP-340 vectors both
+implementations must produce byte-identical signatures. FROST per RFC
+9591 is absent by necessity: its challenge hash differs from BIP-340,
+so libsecp256k1 has no verifier for it.
 
 ### WebAssembly
 

@@ -304,14 +304,12 @@ pub const Via = enum {
 };
 
 pub fn simulate(ctx: cmd.Ctx, args: *Args) !u8 {
-    try args.rejectUnknown(&.{ "suite", "t", "n", "via", "msg-hex", "msg-file", "json", "quiet", "armor", "dir" });
-    const what = args.word(1) orelse {
-        try ctx.warn(
-            "usage: zmpc simulate <keygen|frost|taproot|ecdsa|refresh|hd|all> [--via memory|frames]\n",
-            .{},
-        );
-        return cmd.Exit.usage;
-    };
+    // Each simulation fixes its own suite, party count and message, so there
+    // is nothing here to tune. Flags that look like they would (--suite, --n,
+    // --msg-hex) used to be accepted and silently ignored; rejecting them
+    // keeps the promise the rest of the CLI makes about unknown flags.
+    try args.rejectUnknown(&.{ "via", "json", "quiet", "armor", "dir" });
+    const what = args.word(1) orelse return cmd.usagePage(ctx, "simulate");
 
     const via = if (args.value("via")) |text|
         std.meta.stringToEnum(Via, text) orelse {

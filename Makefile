@@ -63,9 +63,9 @@ wasm:
 wasm-test:
 	$(ZIG) build $(ZIGFLAGS) wasm-test
 
-## run the CLI: make run ARGS="simulate all"
-run cli:
-	$(ZIG) build $(ZIGFLAGS) cli -- $(ARGS)
+## run the CLI: make run ARGS="simulate all"; without ARGS, show help
+run cli: build
+	$(PREFIX)/bin/zmpc $(or $(ARGS),help)
 
 ## rewrite sources in canonical style
 fmt:

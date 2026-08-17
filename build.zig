@@ -42,6 +42,34 @@ pub fn build(b: *std.Build) void {
     const cli_tests = b.addTest(.{ .root_module = cli_mod });
     const run_cli_tests = b.addRunArtifact(cli_tests);
 
+    // Interop tests: the same signatures checked against bitcoin-core's
+    // libsecp256k1, compiled from source out of the package cache. The
+    // defines mirror that project's CMake defaults; schnorrsig (and its
+    // dependency extrakeys) is the only optional module the tests need.
+    const secp_dep = b.dependency("secp256k1", .{});
+    const interop_mod = b.createModule(.{
+        .root_source_file = b.path("test/interop.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "zig_mpc", .module = mod }},
+    });
+    interop_mod.addIncludePath(secp_dep.path("include"));
+    interop_mod.addCSourceFiles(.{
+        .root = secp_dep.path("src"),
+        .files = &.{ "secp256k1.c", "precomputed_ecmult.c", "precomputed_ecmult_gen.c" },
+        .flags = &.{
+            "-DECMULT_WINDOW_SIZE=15",
+            "-DECMULT_GEN_KB=86",
+            "-DENABLE_MODULE_SCHNORRSIG=1",
+            "-DENABLE_MODULE_EXTRAKEYS=1",
+        },
+    });
+    const interop_tests = b.addTest(.{ .root_module = interop_mod });
+    const run_interop_tests = b.addRunArtifact(interop_tests);
+    const interop_step = b.step("interop", "Run the libsecp256k1 interop tests");
+    interop_step.dependOn(&run_interop_tests.step);
+
     // Multi-process end-to-end test: every party in its own process, frames
     // delivered by copying files. Needs the installed binary.
     const e2e = b.addSystemCommand(&.{ "sh", "test/e2e.sh" });
@@ -53,6 +81,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_cli_tests.step);
+    test_step.dependOn(&run_interop_tests.step);
 
     // WebAssembly build of the C ABI, plus the CGGMP24 signing exports, which
     // speak the CLI's frame format. Consumed by test/smoke.mjs and by the

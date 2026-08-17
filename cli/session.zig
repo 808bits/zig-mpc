@@ -497,6 +497,42 @@ pub const Inbox = struct {
     }
 };
 
+/// The most rounds any protocol here has: dkg, auxgen and presign all run
+/// three rounds and a finalize.
+pub const max_rounds: u16 = 4;
+
+/// The subcommand that runs `round` of `protocol`: dkg's fourth round is
+/// `finalize`, signing's third is `aggregate`, and so on. Null when the
+/// protocol has no such round.
+///
+/// This is the same mapping `main.zig` applies in the other direction when it
+/// turns a subcommand into a round number, and it is what lets `zmpc status`
+/// print the next command to run rather than a bare round number.
+pub fn stepName(protocol: frame.Protocol, round: u16) ?[]const u8 {
+    return switch (protocol) {
+        .dkg, .auxgen, .presign => switch (round) {
+            1 => "round1",
+            2 => "round2",
+            3 => "round3",
+            4 => "finalize",
+            else => null,
+        },
+        .refresh => switch (round) {
+            1 => "round1",
+            2 => "round2",
+            3 => "finalize",
+            else => null,
+        },
+        .sign => switch (round) {
+            1 => "commit",
+            2 => "share",
+            3 => "aggregate",
+            else => null,
+        },
+        .none => null,
+    };
+}
+
 /// Every frame party `me` must have received before it can run `round`.
 /// Pure and deterministic - the same table drives `status`, `run`, and the
 /// "still waiting on party 3" message.
@@ -573,6 +609,45 @@ pub fn parseId(text: []const u8) ![32]u8 {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "step names match the subcommands each protocol accepts" {
+    // These are the words `zmpc <protocol> <step>` takes; `status` prints
+    // them back as the command to run next, so a wrong entry here would
+    // advertise a command that does not exist.
+    try testing.expectEqualStrings("round1", stepName(.dkg, 1).?);
+    try testing.expectEqualStrings("round3", stepName(.dkg, 3).?);
+    try testing.expectEqualStrings("finalize", stepName(.dkg, 4).?);
+    try testing.expectEqualStrings("finalize", stepName(.auxgen, 4).?);
+    try testing.expectEqualStrings("finalize", stepName(.presign, 4).?);
+
+    // Refresh has no third round: finalize comes one step earlier.
+    try testing.expectEqualStrings("finalize", stepName(.refresh, 3).?);
+    try testing.expect(stepName(.refresh, 4) == null);
+
+    // Signing names its rounds after what they do.
+    try testing.expectEqualStrings("commit", stepName(.sign, 1).?);
+    try testing.expectEqualStrings("share", stepName(.sign, 2).?);
+    try testing.expectEqualStrings("aggregate", stepName(.sign, 3).?);
+    try testing.expect(stepName(.sign, 4) == null);
+
+    // Round 0 is "nothing has run yet", and `none` runs no rounds at all.
+    try testing.expect(stepName(.dkg, 0) == null);
+    try testing.expect(stepName(.none, 1) == null);
+
+    // Within a protocol the names are distinct, or the reverse lookup in
+    // main.zig would map two rounds onto one command.
+    inline for (comptime std.enums.values(frame.Protocol)) |p| {
+        var i: u16 = 1;
+        while (i <= max_rounds) : (i += 1) {
+            const a = stepName(p, i) orelse continue;
+            var j: u16 = i + 1;
+            while (j <= max_rounds) : (j += 1) {
+                const b = stepName(p, j) orelse continue;
+                try testing.expect(!std.mem.eql(u8, a, b));
+            }
+        }
+    }
+}
 
 test "requirements describe who we are waiting for" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
