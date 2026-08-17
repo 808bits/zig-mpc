@@ -529,6 +529,19 @@ pub fn stepName(protocol: frame.Protocol, round: u16) ?[]const u8 {
             3 => "aggregate",
             else => null,
         },
+        .dkls_setup => switch (round) {
+            1 => "round1",
+            2 => "round2",
+            3 => "finalize",
+            else => null,
+        },
+        .dkls_sign => switch (round) {
+            1 => "phase1",
+            2 => "phase2",
+            3 => "phase3",
+            4 => "finalize",
+            else => null,
+        },
         .none => null,
     };
 }
@@ -579,6 +592,16 @@ pub fn requirements(
                 }
             },
             .sign => try out.append(gpa, .{ .round = prev, .channel = .broadcast, .from = j }),
+            .dkls_setup => try out.append(gpa, .{ .round = prev, .channel = .p2p, .from = j, .to = me }),
+            .dkls_sign => {
+                // Phases 1 and 2 are point-to-point; phase 3 broadcasts the
+                // two scalars every party combines.
+                if (prev == 3) {
+                    try out.append(gpa, .{ .round = prev, .channel = .broadcast, .from = j });
+                } else {
+                    try out.append(gpa, .{ .round = prev, .channel = .p2p, .from = j, .to = me });
+                }
+            },
             .none => {},
         }
     }

@@ -27,6 +27,7 @@ pub const overview =
     \\
     \\  Schnorr (FROST):    init -> dkg -> sign -> verify
     \\  ECDSA (CGGMP24):    init -> dkg -> auxgen -> presign -> ecdsa
+    \\  ECDSA (DKLs23):     init -> dkg -> dkls setup -> dkls sign
     \\
     \\sessions
     \\  init          create one party's session directory. Needs --dir DIR
@@ -44,6 +45,7 @@ pub const overview =
     \\  auxgen        CGGMP24 only: per-party Paillier/Pedersen setup; slow
     \\                at prod sizes, `auxgen primes` pre-generates the primes
     \\  presign       CGGMP24 only: one presignature per future message
+    \\  dkls          DKLs23 ECDSA: pairwise setup, then signing
     \\
     \\signing and keys
     \\  sign          FROST Schnorr: init | commit | share | aggregate | run
@@ -127,7 +129,8 @@ pub const topics = [_]Topic{
     \\                    here; exporting ZMPC_DIR counts as saying it.
     \\
     \\optional
-    \\  --protocol NAME   dkg | refresh | auxgen | presign | sign
+    \\  --protocol NAME   dkg | refresh | auxgen | presign | sign |
+    \\                    dkls_setup | dkls_sign
     \\                    (default: dkg). Use it for dkg and auxgen;
     \\                    refresh, presign and sign have their own `init`
     \\                    that reads the shape from an existing key share.
@@ -283,6 +286,59 @@ pub const topics = [_]Topic{
     \\  --armor           write frames as base64 text instead of binary
     },
 
+    .{ .name = "dkls", .text =
+    \\zmpc dkls - DKLs23 threshold ECDSA
+    \\
+    \\usage: zmpc dkls setup <round1|round2|finalize|run> [options]
+    \\       zmpc dkls sign init --share FILE --setup FILE --signers 1,3 [options]
+    \\       zmpc dkls sign <phase1|phase2|phase3|finalize|run> [options]
+    \\
+    \\The other ECDSA route. CGGMP24 (`auxgen` + `presign` + `ecdsa`) gets its
+    \\multiplication from Paillier encryption and needs safe primes; DKLs23 gets
+    \\it from oblivious transfer and needs none. Use the `dkls` suite.
+    \\
+    \\  zmpc init --dir p1 --suite dkls --party 1 --n 3 --threshold 2
+    \\  zmpc dkg run --dir p1                       # ordinary key generation
+    \\  zmpc init --dir u1 --protocol dkls_setup --suite dkls \
+    \\        --party 1 --n 3 --threshold 2 --session <id>
+    \\  zmpc dkls setup run --dir u1 --share p1/artifacts/keyshare.zmpc
+    \\
+    \\dkls setup
+    \\  Runs among ALL parties and is reusable: any later quorum picks out the
+    \\  entries it needs. This is the expensive step - each pair of parties
+    \\  costs 256 oblivious transfers and a proof of work - and its messages
+    \\  are large, tens of kilobytes per counterparty. It only happens once.
+    \\
+    \\  --share FILE      the key share this setup belongs to
+    \\  round1            base-OT material, both directions            [p2p]
+    \\  round2            open the zero-share seed commitments         [p2p]
+    \\  finalize          check everything, write artifacts/dkls-setup.zmpc
+    \\
+    \\dkls sign init
+    \\  --share FILE      this party's key share                  (required)
+    \\  --setup FILE      the dkls-setup.zmpc from above          (required)
+    \\  --signers LIST    comma-separated party numbers; at least `threshold`
+    \\                    of them, and must include this party    (required)
+    \\  --msg-file FILE   the message to sign, read from a file
+    \\  --msg-hex HEX     the message to sign, as hex
+    \\                    (one of the two is required)
+    \\  --session HEX     64 hex characters shared by every signer
+    \\                    (default: random, printed on stdout)
+    \\  --dir DIR         where to create the session            (required)
+    \\
+    \\  One session signs one message. The session id separates concurrent
+    \\  signings: the base-OT correlations are reused across signatures, and
+    \\  every per-signature value is derived from that id, so two sessions must
+    \\  never share one. Never copy a session directory and run both halves.
+    \\
+    \\steps: phase1, phase2, phase3, finalize (or `run`)
+    \\  --share FILE      read the key share from here instead
+    \\  --setup FILE      read the setup artifact from here instead
+    \\
+    \\`finalize` writes <dir>/artifacts/signature.bin: 64 bytes of r||s. Check
+    \\it with `zmpc verify --suite dkls --pubkey <hex> --msg-file ... --sig ...`,
+    \\or with any ordinary ECDSA verifier - the output is a plain signature.
+    },
     .{ .name = "presign", .text =
     \\zmpc presign - CGGMP24 presigning, before the message is known
     \\

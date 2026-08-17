@@ -13,6 +13,24 @@ pub fn build(b: *std.Build) void {
     const mod_tests = b.addTest(.{ .root_module = mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
+    // The DKLs23 tests are compiled optimized regardless of -Doptimize.
+    // They run hundreds of endemic OTs and two Fischlin proofs of work, which
+    // in a debug build takes minutes and dominates the whole suite; at
+    // ReleaseSafe it is seconds, and every safety check is still on, so
+    // nothing is traded away except the wait. They are excluded from
+    // `mod_tests` (see the `test` block in src/root.zig) to avoid running
+    // twice.
+    const dkls_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/dkls.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const run_dkls_tests = b.addRunArtifact(dkls_tests);
+    const dkls_step = b.step("dkls", "Run the DKLs23 tests");
+    dkls_step.dependOn(&run_dkls_tests.step);
+
     // Release builds stamp the tag in (`-Dversion=0.0.1`) and drop debug info;
     // a plain `zig build` keeps the dev version and the symbols.
     const version = b.option([]const u8, "version", "Version reported by `zmpc version`") orelse "0.1.0-dev";
@@ -80,6 +98,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
+    test_step.dependOn(&run_dkls_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_interop_tests.step);
 

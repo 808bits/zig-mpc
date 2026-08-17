@@ -381,11 +381,50 @@ pub fn verify(
 ) !u8 {
     return switch (st) {
         inline .ed25519, .secp256k1, .taproot => |tag| verifyFor(tag, ctx, pubkey_hex, msg, sig_bytes),
+        // The ECDSA suites all produce plain r||s over secp256k1, whoever
+        // generated it: DKLs23, CGGMP24, or a single signer.
+        .dkls, .ecdsa_fast, .ecdsa_prod => verifyEcdsa(ctx, pubkey_hex, msg, sig_bytes),
         else => {
-            try ctx.warn("suite '{t}' has no FROST signature format\n", .{st});
+            try ctx.warn("suite '{t}' has no signature format to verify\n", .{st});
             return cmd.Exit.usage;
         },
     };
+}
+
+/// Verify a secp256k1 ECDSA signature, hashing the message with SHA-256.
+fn verifyEcdsa(ctx: cmd.Ctx, pubkey_hex: []const u8, msg: []const u8, sig_bytes: []const u8) !u8 {
+    const E = mpc.curve.Secp256k1;
+    var pk_bytes: [E.Point.encoded_length]u8 = undefined;
+    cmd.hexExact(&pk_bytes, pubkey_hex) catch {
+        try ctx.warn("--pubkey must be {d} bytes of hex\n", .{E.Point.encoded_length});
+        return cmd.Exit.usage;
+    };
+    const pk = E.Point.fromBytes(pk_bytes) catch {
+        try ctx.warn("--pubkey is not a valid point\n", .{});
+        return cmd.Exit.bad_input;
+    };
+    if (sig_bytes.len != 64) {
+        try ctx.warn("an ECDSA signature here is 64 bytes (r||s); got {d}\n", .{sig_bytes.len});
+        return cmd.Exit.bad_input;
+    }
+
+    var h: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(msg, &h, .{});
+    const r = E.Scalar.fromBytes(sig_bytes[0..32].*) catch {
+        try ctx.warn("signature is malformed\n", .{});
+        return cmd.Exit.bad_input;
+    };
+    const sc = E.Scalar.fromBytes(sig_bytes[32..64].*) catch {
+        try ctx.warn("signature is malformed\n", .{});
+        return cmd.Exit.bad_input;
+    };
+    if (!mpc.dkls.sign.verify(E, pk, h, .{ .r = r, .s = sc, .recovery_id = 0 })) {
+        try ctx.warn("signature is INVALID\n", .{});
+        return cmd.Exit.protocol;
+    }
+    try ctx.note("signature is valid\n", .{});
+    if (ctx.json) try ctx.emit("{{\"valid\":true}}\n", .{});
+    return cmd.Exit.ok;
 }
 
 fn verifyFor(

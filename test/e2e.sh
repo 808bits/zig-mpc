@@ -397,6 +397,74 @@ printf 'signed without party 1' > tx23.bin
 if "$ZMPC" ecdsa verify --pubkey "$EPK" --msg-file tx23.bin --sig sig23.bin --quiet
 then ok "a signing set without party 1 produces the same key's signature"
 else fail "signers {2,3}"; fi
+
+say "DKLs23 threshold ECDSA (slow: 256 oblivious transfers per pair)"
+SIDD=$("$ZMPC" init --dir d1 --suite dkls --party 1 --n 3 --threshold 2 --quiet)
+for i in 2 3; do
+  "$ZMPC" init --dir "d$i" --suite dkls --party "$i" --n 3 --threshold 2 \
+      --session "$SIDD" --quiet >/dev/null
+done
+for r in round1 round2 round3 finalize; do step "1:d1 2:d2 3:d3" dkg "$r"; done
+DPK=$("$ZMPC" share pubkey --dir d1)
+ok "keygen done (dkls suite)"
+
+SIDS=$("$ZMPC" init --dir k1 --protocol dkls_setup --suite dkls --party 1 \
+      --n 3 --threshold 2 --quiet)
+for i in 2 3; do
+  "$ZMPC" init --dir "k$i" --protocol dkls_setup --suite dkls --party "$i" \
+      --n 3 --threshold 2 --session "$SIDS" --quiet >/dev/null
+done
+for r in round1 round2 finalize; do
+  for i in 1 2 3; do
+    "$ZMPC" dkls setup "$r" --dir "k$i" --share "d$i/artifacts/keyshare.zmpc" \
+        --quiet >/dev/null
+  done
+  deliver "1:k1 2:k2 3:k3"
+done
+ok "pairwise setup complete for all three parties"
+
+printf 'pay alice 1 BTC' > dtx.bin
+SIDV=$("$ZMPC" dkls sign init --dir m1 --share d1/artifacts/keyshare.zmpc \
+      --setup k1/artifacts/dkls-setup.zmpc --signers 1,3 --msg-file dtx.bin --quiet)
+"$ZMPC" dkls sign init --dir m3 --share d3/artifacts/keyshare.zmpc \
+      --setup k3/artifacts/dkls-setup.zmpc --signers 1,3 --msg-file dtx.bin \
+      --session "$SIDV" --quiet >/dev/null
+for r in phase1 phase2 phase3 finalize; do
+  for d in m1 m3; do "$ZMPC" dkls sign "$r" --dir "$d" --quiet >/dev/null; done
+  deliver "1:m1 3:m3"
+done
+
+# Both signers must land on the identical signature; they combine the same
+# broadcast components, so any divergence means a routing or ordering bug.
+same "both signers produce the same signature" \
+     "$(od -An -tx1 -v < m1/artifacts/signature.bin | tr -d ' \n')" \
+     "$(od -An -tx1 -v < m3/artifacts/signature.bin | tr -d ' \n')"
+
+if "$ZMPC" verify --suite dkls --pubkey "$DPK" --msg-file dtx.bin \
+      --sig m1/artifacts/signature.bin --quiet
+then ok "DKLs23 signature verifies as ordinary ECDSA"; else fail "dkls verify"; fi
+
+set +e
+"$ZMPC" verify --suite dkls --pubkey "$DPK" --msg-file tampered.bin \
+      --sig m1/artifacts/signature.bin >/dev/null 2>&1
+code=$?
+set -e
+[ "$code" = "65" ] && ok "a tampered DKLs23 message is rejected" || fail "expected 65, got $code"
+
+# The setup artifact is quorum-independent: a different pair must be able to
+# sign from the same setup with no extra rounds.
+SIDW=$("$ZMPC" dkls sign init --dir q2 --share d2/artifacts/keyshare.zmpc \
+      --setup k2/artifacts/dkls-setup.zmpc --signers 2,3 --msg-file dtx.bin --quiet)
+"$ZMPC" dkls sign init --dir q3 --share d3/artifacts/keyshare.zmpc \
+      --setup k3/artifacts/dkls-setup.zmpc --signers 2,3 --msg-file dtx.bin \
+      --session "$SIDW" --quiet >/dev/null
+for r in phase1 phase2 phase3 finalize; do
+  for d in q2 q3; do "$ZMPC" dkls sign "$r" --dir "$d" --quiet >/dev/null; done
+  deliver "2:q2 3:q3"
+done
+if "$ZMPC" verify --suite dkls --pubkey "$DPK" --msg-file dtx.bin \
+      --sig q2/artifacts/signature.bin --quiet
+then ok "a different quorum reuses the same setup"; else fail "signers {2,3}"; fi
 fi
 
 printf '\n\033[1m%d checks passed\033[0m\n' "$pass"

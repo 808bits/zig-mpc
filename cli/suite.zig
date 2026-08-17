@@ -22,7 +22,7 @@ pub const Suite = frame.Suite;
 pub fn CurveOf(comptime s: Suite) type {
     return switch (s) {
         .ed25519 => mpc.curve.Ed25519,
-        .secp256k1, .taproot, .ecdsa_fast, .ecdsa_prod => mpc.curve.Secp256k1,
+        .secp256k1, .taproot, .ecdsa_fast, .ecdsa_prod, .dkls => mpc.curve.Secp256k1,
         .p256 => mpc.curve.P256,
         .p384 => mpc.curve.P384,
     };
@@ -86,6 +86,8 @@ pub fn isCggmp(s: Suite) bool {
     return s == .ecdsa_fast or s == .ecdsa_prod;
 }
 
+/// Whether `zmpc sign` (FROST) applies. DKLs23 and CGGMP24 sign ECDSA through
+/// their own commands instead.
 pub fn canSign(s: Suite) bool {
     return switch (s) {
         .ed25519, .secp256k1, .taproot => true,
@@ -93,11 +95,15 @@ pub fn canSign(s: Suite) bool {
     };
 }
 
+pub fn isDkls(s: Suite) bool {
+    return s == .dkls;
+}
+
 pub fn parse(text: []const u8) ?Suite {
     return std.meta.stringToEnum(Suite, text);
 }
 
-pub const names = "ed25519 | secp256k1 | taproot | p256 | p384 | ecdsa_fast | ecdsa_prod";
+pub const names = "ed25519 | secp256k1 | taproot | p256 | p384 | ecdsa_fast | ecdsa_prod | dkls";
 
 // ---------------------------------------------------------------------------
 // Tests

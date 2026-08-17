@@ -3,6 +3,7 @@
 
 pub const abort = @import("abort.zig");
 pub const curve = @import("curve.zig");
+pub const dkls = @import("dkls.zig");
 pub const transcript = @import("transcript.zig");
 pub const message = @import("message.zig");
 pub const vss = @import("vss.zig");
@@ -23,6 +24,7 @@ pub const testdata_paillier = @import("testdata/paillier_vectors.zig");
 
 test {
     _ = abort;
+    // dkls is tested by its own optimized target; see build.zig.
     _ = serde;
     _ = ecdsa;
     _ = refresh;

@@ -42,6 +42,8 @@ pub const Kind = enum(u8) {
     /// Relay handshake: announces (session, party) on a new connection.
     hello = 7,
     signature = 8,
+    /// DKLs23 pairwise setup: base-OT correlations and zero-share seeds.
+    dkls_setup = 9,
 };
 
 pub const Channel = enum(u8) {
@@ -59,6 +61,8 @@ pub const Protocol = enum(u16) {
     auxgen = 3,
     presign = 4,
     sign = 5,
+    dkls_setup = 7,
+    dkls_sign = 8,
     /// Artifacts and relay control frames belong to no round protocol.
     none = 6,
 };
@@ -77,6 +81,9 @@ pub const Suite = enum(u16) {
     ecdsa_fast = 0x0101,
     /// secp256k1 + Params(1024, 256, 512, 512), M = 80 - 2048-bit Paillier.
     ecdsa_prod = 0x0102,
+    /// secp256k1 + DKLs23. ECDSA without Paillier: no aux-info step, and
+    /// signing needs only the pairwise setup in `zmpc dkls setup`.
+    dkls = 0x0201,
 };
 
 pub const Header = struct {
@@ -238,6 +245,7 @@ fn armorLabel(kind: Kind) []const u8 {
         .primes => "PRIMES",
         .hello => "HELLO",
         .signature => "SIGNATURE",
+        .dkls_setup => "DKLS SETUP",
     };
 }
 

@@ -11,6 +11,7 @@ const mpc = @import("zig_mpc");
 
 pub const args_mod = @import("args.zig");
 pub const auxgen = @import("auxgen.zig");
+const dkls = @import("dkls.zig");
 pub const cmd = @import("cmd.zig");
 pub const dkg = @import("dkg.zig");
 pub const ecdsa = @import("ecdsa.zig");
@@ -112,6 +113,7 @@ fn dispatch(ctx: *cmd.Ctx, args: *Args) !u8 {
     if (eql(command, "dkg")) return cmdDkg(ctx, args);
     if (eql(command, "auxgen")) return cmdAuxgen(ctx, args);
     if (eql(command, "presign")) return cmdPresign(ctx, args);
+    if (eql(command, "dkls")) return cmdDkls(ctx, args);
     if (eql(command, "ecdsa")) return cmdEcdsa(ctx, args);
     if (eql(command, "refresh")) return cmdRefresh(ctx, args);
     if (eql(command, "hd")) return cmdHd(ctx, args);
@@ -867,6 +869,153 @@ fn cmdSignInit(ctx: *cmd.Ctx, args: *Args) !u8 {
 }
 
 // ---------------------------------------------------------------------------
+// dkls - DKLs23 threshold ECDSA
+// ---------------------------------------------------------------------------
+
+fn cmdDkls(ctx: *cmd.Ctx, args: *Args) !u8 {
+    const which = args.word(1) orelse return cmd.usagePage(ctx.*, "dkls");
+    if (eql(which, "setup")) return cmdDklsSetup(ctx, args);
+    if (eql(which, "sign")) return cmdDklsSign(ctx, args);
+    try ctx.warn("dkls has 'setup' and 'sign'; got '{s}'\n", .{which});
+    return cmd.Exit.usage;
+}
+
+fn cmdDklsSetup(ctx: *cmd.Ctx, args: *Args) !u8 {
+    const step = args.word(2) orelse return cmd.usagePage(ctx.*, "dkls");
+    try args.rejectUnknown(&.{ "dir", "share", "armor", "json", "quiet" });
+    var s = try openSession(ctx, args);
+    if (s.protocol != .dkls_setup) {
+        try ctx.warn("this session runs '{s}', not dkls setup\n", .{s.manifest.protocol});
+        return cmd.Exit.usage;
+    }
+    const share_override = args.value("share");
+    if (eql(step, "run")) return dkls.setupRunAll(ctx.*, &s, share_override);
+
+    const round = roundOfStep(.dkls_setup, step) orelse {
+        try ctx.warn("unknown dkls setup step '{s}'\n", .{step});
+        return cmd.Exit.usage;
+    };
+    if (try guardRound(ctx, &s, round, step)) |code| return code;
+    return dkls.setupRun(ctx.*, &s, round, share_override);
+}
+
+fn cmdDklsSign(ctx: *cmd.Ctx, args: *Args) !u8 {
+    const step = args.word(2) orelse return cmd.usagePage(ctx.*, "dkls");
+    if (eql(step, "init")) return cmdDklsSignInit(ctx, args);
+
+    try args.rejectUnknown(&.{ "dir", "share", "setup", "armor", "json", "quiet" });
+    var s = try openSession(ctx, args);
+    if (s.protocol != .dkls_sign) {
+        try ctx.warn("this session runs '{s}', not dkls sign\n", .{s.manifest.protocol});
+        return cmd.Exit.usage;
+    }
+    const paths = dkls.Paths{ .share = args.value("share"), .setup = args.value("setup") };
+    if (eql(step, "run")) return dkls.signRunAll(ctx.*, &s, paths);
+
+    const round = roundOfStep(.dkls_sign, step) orelse {
+        try ctx.warn("unknown dkls sign step '{s}'\n", .{step});
+        return cmd.Exit.usage;
+    };
+    if (try guardRound(ctx, &s, round, step)) |code| return code;
+    return dkls.signRun(ctx.*, &s, round, paths);
+}
+
+fn cmdDklsSignInit(ctx: *cmd.Ctx, args: *Args) !u8 {
+    try args.rejectUnknown(&.{
+        "dir",     "share",   "setup", "signers", "msg-file",
+        "msg-hex", "session", "armor", "json",    "quiet",
+    });
+
+    const share_path = try args.require("share");
+    const setup_path = try args.require("setup");
+    const f = cmd.readFrame(ctx.*, share_path) catch |e| {
+        try ctx.warn("cannot read key share '{s}': {t}\n", .{ share_path, e });
+        return cmd.Exit.bad_input;
+    };
+    if (f.header.kind != .key_share) {
+        try ctx.warn("'{s}' is not a key share\n", .{share_path});
+        return cmd.Exit.bad_input;
+    }
+    if (f.header.suite != .dkls) {
+        try ctx.warn(
+            "DKLs23 signing needs a 'dkls' key share; '{s}' is {t}\n",
+            .{ share_path, f.header.suite },
+        );
+        return cmd.Exit.usage;
+    }
+
+    const shape = try shareShape(ctx, f);
+    const signers = try args.intList(u16, ctx.gpa, "signers");
+    if (try rejectBadSignerSet(ctx, signers, shape)) |code| return code;
+
+    const msg = cmd.readMessage(ctx.*, args.value("msg-file"), args.value("msg-hex")) catch |e| {
+        switch (e) {
+            error.NoMessage => try ctx.warn("give the message with --msg-file or --msg-hex\n", .{}),
+            error.InvalidHex => try ctx.warn("--msg-hex is not valid hex\n", .{}),
+            else => try ctx.warn("cannot read the message: {t}\n", .{e}),
+        }
+        return cmd.Exit.bad_input;
+    };
+
+    // The session id separates concurrent signings under one key. DKLs23 reuses
+    // its base-OT correlations across signatures, and every per-signature value
+    // is derived from this id, so two sessions must never share one.
+    const id_hex = if (args.value("session")) |given| blk: {
+        _ = session.parseId(given) catch {
+            try ctx.warn("--session must be 64 hex characters\n", .{});
+            return cmd.Exit.usage;
+        };
+        break :blk given;
+    } else blk: {
+        var id: [32]u8 = undefined;
+        ctx.rng.bytes(&id);
+        break :blk try session.hexId(ctx.gpa, id);
+    };
+
+    var found = false;
+    for (signers) |sgn| {
+        if (sgn == shape.party) found = true;
+    }
+    if (!found) {
+        try ctx.warn("this share belongs to party {d}, which is not in --signers\n", .{shape.party});
+        return cmd.Exit.usage;
+    }
+
+    const dir = try requireLocation(ctx, args, "dkls") orelse return cmd.Exit.usage;
+    var s = session.Session.create(ctx.env(), dir, .{
+        .session = id_hex,
+        .protocol = "dkls_sign",
+        .suite = @tagName(f.header.suite),
+        .party = shape.party,
+        .n_parties = shape.n_parties,
+        .threshold = shape.threshold,
+        .signers = signers,
+        .share_path = share_path,
+        // The setup artifact plays the same role aux-info does for CGGMP24,
+        // so it rides in the same manifest slot.
+        .aux_path = setup_path,
+    }) catch |e| switch (e) {
+        error.SessionExists => {
+            try ctx.warn("a session already exists in '{s}'\n", .{dir});
+            return cmd.Exit.usage;
+        },
+        else => return e,
+    };
+
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{
+        .sub_path = try s.artifactPath("message.bin"),
+        .data = msg,
+    });
+
+    try ctx.note(
+        "DKLs23 signing session for party {d} ({d} signers, {d} bytes to sign)\n",
+        .{ shape.party, signers.len, msg.len },
+    );
+    try ctx.emit("{s}\n", .{id_hex});
+    return cmd.Exit.ok;
+}
+
+// ---------------------------------------------------------------------------
 // verify
 // ---------------------------------------------------------------------------
 
@@ -954,6 +1103,8 @@ fn cmdNode(ctx: *cmd.Ctx, args: *Args) !u8 {
             .auxgen => try auxgen.run(ctx.*, &s, null, args.value("primes")),
             .presign => try ecdsa.run(ctx.*, &s, null, paths),
             .sign => try sign.run(ctx.*, &s, null, args.value("share")),
+            .dkls_setup => try dkls.setupRun(ctx.*, &s, null, args.value("share")),
+            .dkls_sign => try dkls.signRun(ctx.*, &s, null, .{ .share = args.value("share"), .setup = args.value("setup") }),
             .none => {
                 try ctx.warn("this session has no protocol to run\n", .{});
                 return cmd.Exit.usage;

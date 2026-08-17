@@ -7,8 +7,13 @@ Threshold signing in Zig, built on the standard library's cryptography:
 | **EdDSA Ed25519** | Solana, Cardano, TON, Near | FROST (RFC 9591) | RFC 9591 vectors byte-exact; verifies under `std.crypto`'s Ed25519 |
 | **Schnorr BIP-340** | Bitcoin Taproot | FROST (Taproot mode) | all 19 official BIP-340 vectors; threshold sigs verify as plain BIP-340 |
 | **ECDSA secp256k1** | Bitcoin, Ethereum, EVM, Cosmos | CGGMP24 | end-to-end presign+sign; verifies under `std.crypto`'s ECDSA |
+| **ECDSA secp256k1** | same | DKLs23 | oracles, GF(2^208) and both ZK proofs checked against the reference implementation; end-to-end signatures verify under `std.crypto`'s ECDSA |
 
-Plus: trustless 3-round DKG (curve-generic, shared by FROST and CGGMP),
+Two independent routes to threshold ECDSA: CGGMP24 buys its multiplication
+with Paillier encryption and a slow safe-prime setup, DKLs23 buys it with
+oblivious transfer and needs no RSA modulus at all.
+
+Plus: trustless 3-round DKG (curve-generic, shared by FROST, CGGMP and DKLs),
 proactive key refresh, BIP-32/SLIP-10 non-hardened HD derivation
 (SLIP-10 vectors), a canonical wire format for every protocol message, a
 WebAssembly build that runs the full ceremony (DKG, FROST signing, CGGMP24
@@ -131,7 +136,7 @@ or malformed input, `65` protocol abort (bad proof, share, or signature),
 | `--n N` | required; how many parties in total (at least 2) |
 | `--threshold T` | required; how many are needed to sign, `1..n` |
 | `--dir D` | required; where to create the session (`--dir .` for here). `ZMPC_DIR` satisfies it too |
-| `--protocol P` | `dkg` (default) or `auxgen`; `refresh`, `presign` and `sign` sessions are created by their own `init` subcommands instead |
+| `--protocol P` | `dkg` (default), `auxgen` or `dkls_setup`; `refresh`, `presign`, `sign` and `dkls sign` sessions are created by their own `init` subcommands instead |
 | `--session HEX` | the 64-hex run id printed by the first party's `init`; omit to mint a new one |
 
 **`zmpc status`** - report this session's round progress, inbox contents, and
@@ -190,6 +195,37 @@ writes `artifacts/presignature.zmpc`, which `zmpc ecdsa sign` later consumes.
 | `--aux FILE` | `init`: required; this party's `auxinfo.zmpc`. Rounds: override |
 | `--signers 1,3` | `init`: required; the exact signing set, which must include this party |
 | `--session HEX` | `init`: join the run started by the first signer |
+
+**`zmpc dkls setup round1|round2|finalize|run`** - DKLs23 pairwise setup:
+base-OT correlations and zero-share seeds, established once among all parties
+and reused by every later signature, whichever quorum signs. `finalize` writes
+`artifacts/dkls-setup.zmpc`. The session is created with
+`zmpc init --protocol dkls_setup --suite dkls`.
+
+This is the expensive step, and the direct counterpart of `auxgen`: each
+ordered pair of parties runs 256 endemic oblivious transfers and one proof of
+work, so round-1 messages are tens of kilobytes per counterparty. Unlike
+`auxgen` it generates no primes, so there is nothing to pre-compute.
+
+| option | meaning |
+|---|---|
+| `--share FILE` | required; the `dkls` key share this setup belongs to |
+
+**`zmpc dkls sign init|phase1|phase2|phase3|finalize|run`** - DKLs23 signing,
+three rounds. `finalize` writes `artifacts/signature.bin`: 64 bytes of `r||s`,
+an ordinary ECDSA signature that any verifier accepts.
+
+| option | meaning |
+|---|---|
+| `--share FILE` | `init`: required; a `dkls` key share. Phases: override |
+| `--setup FILE` | `init`: required; this party's `dkls-setup.zmpc`. Phases: override |
+| `--signers 1,3` | `init`: required; the signing set, which must include this party |
+| `--msg-file F` / `--msg-hex H` | `init`: the message to sign |
+| `--session HEX` | `init`: join the run started by the first signer |
+
+One session signs one message. The base-OT correlations are reused across
+signatures and every per-signature value is derived from the session id, so two
+sessions must never share one: never copy a session directory and run both.
 
 **`zmpc sign init|commit|share|aggregate|run`** - FROST two-round signing
 (`ed25519`, `secp256k1`, `taproot` shares). `share` destroys the nonces as it
