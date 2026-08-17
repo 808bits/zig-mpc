@@ -145,7 +145,7 @@ pub fn Ecdsa(comptime P: type, comptime E: type) type {
         // helpers
         // ------------------------------------------------------------------
 
-        /// Curve scalar → signed integer in ±q/2 (the reference's
+        /// Curve scalar to signed integer in ±q/2 (the reference's
         /// `scalar_to_pm_bignumber`).
         fn scalarToPm(s_: E.Scalar) S {
             const enc = E.Scalar.encoded_length;

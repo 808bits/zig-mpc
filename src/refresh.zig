@@ -5,8 +5,8 @@
 //! inconsistent with the new commitment and are useless to an attacker who
 //! later compromises fewer than t parties.
 //!
-//! 3 rounds, mirroring the DKG: hash-commit → decommit + p2p shares →
-//! verification. Transport must provide consistent broadcast; p2p shares
+//! 3 rounds, mirroring the DKG: hash-commit, then decommit + p2p shares,
+//! then verification. Transport must provide consistent broadcast; p2p shares
 //! must be confidential.
 
 const std = @import("std");

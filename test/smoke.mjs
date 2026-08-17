@@ -53,7 +53,7 @@ for (const [name, suite] of Object.entries(SUITES)) {
   const pk = fin.get(1).pubkey;
   ok(
     PARTIES.every((p) => hex(fin.get(p).pubkey) === hex(pk)),
-    `all parties agree on the public key (${hex(pk).slice(0, 16)}…)`,
+    `all parties agree on the public key (${hex(pk).slice(0, 16)}...)`,
   );
   ok(hex(z.sharePubkey(fin.get(2).keyshare)) === hex(pk), "share_pubkey reads it back");
 
