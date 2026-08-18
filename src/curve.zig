@@ -29,6 +29,13 @@ fn WeierstrassCurve(comptime C: type, comptime curve_name: []const u8) type {
         /// Endianness of the canonical scalar encoding.
         pub const scalar_endian: std.builtin.Endian = .big;
 
+        /// Whether `bytes` encodes a canonical field element (big-endian,
+        /// less than the field prime). BIP-340 needs this for signature `r`.
+        pub fn feCanonical(bytes: [C.Fe.encoded_length]u8) bool {
+            _ = C.Fe.fromBytes(bytes, .big) catch return false;
+            return true;
+        }
+
         pub const Scalar = struct {
             /// Canonical big-endian encoding; always fully reduced.
             b: [sc.encoded_length]u8,
@@ -207,7 +214,21 @@ fn WeierstrassCurve(comptime C: type, comptime curve_name: []const u8) type {
     };
 }
 
-pub const Secp256k1 = WeierstrassCurve(crypto.ecc.Secp256k1, "secp256k1");
+/// The std.crypto secp256k1, always available (it is the only option for
+/// wasm, and the reference the libsecp backend is tested against).
+pub const Secp256k1Std = WeierstrassCurve(crypto.ecc.Secp256k1, "secp256k1");
+
+/// The secp256k1 every protocol actually uses. Selected at build time
+/// (`-Dsecp=std|libsecp` via the `secp_backend` module): either the std
+/// backend above, or bitcoin-core/libsecp256k1 behind the same declaration
+/// surface (`curve_libsecp.zig`). The two produce identical bytes for every
+/// operation, so artifacts and frames interoperate across backends; the
+/// difference is speed (libsecp multiplies ~4x faster) and the C dependency.
+pub const Secp256k1 = if (@import("secp_backend").use_libsecp)
+    @import("curve_libsecp.zig").Secp256k1
+else
+    Secp256k1Std;
+
 pub const P256 = WeierstrassCurve(crypto.ecc.P256, "p256");
 pub const P384 = WeierstrassCurve(crypto.ecc.P384, "p384");
 
@@ -441,4 +462,12 @@ test "bip340 x-only helpers (secp256k1)" {
     try std.testing.expect(recovered.hasEvenY());
     // recovered point equals p or -p; x coordinates must match
     try std.testing.expectEqualSlices(u8, &x, &recovered.xOnly());
+}
+
+test {
+    // The cross-backend equivalence tests live with the libsecp binding and
+    // only exist when that backend is compiled in.
+    if (@import("secp_backend").use_libsecp) {
+        _ = @import("curve_libsecp.zig");
+    }
 }

@@ -83,7 +83,7 @@ pub fn sign(secret_key: [32]u8, msg: []const u8, aux_rand: [32]u8) ![64]u8 {
 pub fn verify(public_key_x: [32]u8, msg: []const u8, sig: [64]u8) bool {
     const P = liftX(public_key_x) catch return false;
     // r must be a canonical field element, s a canonical scalar.
-    _ = E.Underlying.Fe.fromBytes(sig[0..32].*, .big) catch return false;
+    if (!E.feCanonical(sig[0..32].*)) return false;
     const s = E.Scalar.fromBytes(sig[32..].*) catch return false;
     const e = challengeScalar(sig[0..32].*, public_key_x, msg);
     // R = sG - eP; must not be infinite, must have even Y, x(R) == r.
