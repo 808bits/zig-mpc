@@ -11,7 +11,7 @@
 #   ZIG=zig                     compiler to use
 #   OPTIMIZE=Debug              Debug | ReleaseSafe | ReleaseFast | ReleaseSmall
 #   TARGET=                     cross-compilation target triple, e.g. aarch64-linux
-#   SECP=                       secp256k1 backend: libsecp (default) | std
+#   SECP=                       secp256k1 backend: libsecp (default) | glv | std
 #   PREFIX=zig-out              install destination
 #   ARGS=                       arguments forwarded by `make run` and `make e2e`
 

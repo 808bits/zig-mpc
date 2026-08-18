@@ -17,7 +17,12 @@ const S = mpc.dkls.sign.Signer(E);
 const n: u16 = 3;
 const threshold: u16 = 2;
 const sign_iters = 10;
-const backend_name = if (@import("secp_backend").use_libsecp) "libsecp" else "std";
+const backend_name = blk: {
+    const b = @import("secp_backend");
+    if (b.use_libsecp) break :blk "libsecp";
+    if (b.use_glv) break :blk "glv";
+    break :blk "std";
+};
 
 fn ms(nanos: u64) f64 {
     return @as(f64, @floatFromInt(nanos)) / 1e6;

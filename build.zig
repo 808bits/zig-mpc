@@ -8,15 +8,16 @@ pub fn build(b: *std.Build) void {
     // (pure Zig, the only choice for wasm). The protocols are generic over
     // the curve type, so this flag is the entire difference; switching back
     // is `-Dsecp=std`. See src/curve.zig and src/curve_libsecp.zig.
-    const SecpBackend = enum { std, libsecp };
+    const SecpBackend = enum { std, glv, libsecp };
     const secp_backend = b.option(SecpBackend, "secp", "secp256k1 backend (default: libsecp)") orelse .libsecp;
     const secp_backend_file: []const u8 = switch (secp_backend) {
         .std => "src/secp_backend/std.zig",
+        .glv => "src/secp_backend/glv.zig",
         .libsecp => "src/secp_backend/libsecp.zig",
     };
     const secp_backend_mod = b.createModule(.{ .root_source_file = b.path(secp_backend_file) });
-    // wasm has no libc and no C toolchain target here; it always gets std.
-    const secp_backend_std_mod = b.createModule(.{ .root_source_file = b.path("src/secp_backend/std.zig") });
+    // wasm cannot link C, so it gets the best pure-Zig backend: GLV.
+    const secp_backend_wasm_mod = b.createModule(.{ .root_source_file = b.path("src/secp_backend/glv.zig") });
 
     // libsecp256k1 itself, compiled once and linked wherever it is needed:
     // into the library when the libsecp backend is selected, and into the
@@ -186,8 +187,8 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSmall,
             .imports = &.{
                 .{ .name = "frame", .module = wasm_frame_mod },
-                // No C toolchain in the freestanding wasm build: std only.
-                .{ .name = "secp_backend", .module = secp_backend_std_mod },
+                // No C toolchain in the freestanding wasm build: pure Zig.
+                .{ .name = "secp_backend", .module = secp_backend_wasm_mod },
             },
         }),
     });

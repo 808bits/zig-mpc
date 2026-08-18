@@ -13,14 +13,16 @@ Two independent routes to threshold ECDSA: CGGMP24 buys its multiplication
 with Paillier encryption and a slow safe-prime setup, DKLs23 buys it with
 oblivious transfer and needs no RSA modulus at all.
 
-secp256k1 point arithmetic has two interchangeable backends behind one
-comptime interface: bitcoin-core/libsecp256k1 (the default - its GLV
-endomorphism and precomputed tables make DKLs23 setup ~5x faster) and
-std.crypto (`zig build -Dsecp=std`; always used for wasm, which has no C).
-The two produce identical bytes for every operation - the equivalence is
-tested op by op - so key shares, frames and signatures interoperate across
-backends, and switching is only ever a build flag. `zig build bench` and
-`zig build bench -Dsecp=std` measure the difference on your machine.
+secp256k1 point arithmetic has three interchangeable backends behind one
+comptime interface, selected with `-Dsecp=std|glv|libsecp`:
+bitcoin-core/libsecp256k1 (the default; ~5x faster DKLs23 setup),
+std.crypto as shipped, and `glv` - std.crypto with proper GLV endomorphism
+multiplication added in `src/glv.zig` (~1.2-1.5x over plain std, pure Zig,
+and what the wasm build uses since it cannot link C). All three produce
+identical bytes for every operation - the equivalence is tested op by op -
+so key shares, frames and signatures interoperate across backends, and
+switching is only ever a build flag. `zig build bench -Dsecp=...` measures
+the differences on your machine.
 
 Plus: trustless 3-round DKG (curve-generic, shared by FROST, CGGMP and DKLs),
 proactive key refresh, BIP-32/SLIP-10 non-hardened HD derivation

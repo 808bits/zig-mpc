@@ -12,6 +12,14 @@ const crypto = std.crypto;
 /// Weierstrass curves from std.crypto.ecc share one API shape (endian-parameterized
 /// scalar ops, SEC1 point encodings); this wraps any of them.
 fn WeierstrassCurve(comptime C: type, comptime curve_name: []const u8) type {
+    return WeierstrassCurveImpl(C, curve_name, null);
+}
+
+/// As `WeierstrassCurve`, with the four scalar multiplications optionally
+/// replaced by `MulImpl` (std-shaped signatures over the raw curve type).
+/// This is how the GLV backend swaps in faster multiplication while keeping
+/// every other operation, and the Scalar type itself, literally std's.
+fn WeierstrassCurveImpl(comptime C: type, comptime curve_name: []const u8, comptime MulImpl: ?type) type {
     return struct {
         pub const name = curve_name;
         pub const Underlying = C;
@@ -159,21 +167,25 @@ fn WeierstrassCurve(comptime C: type, comptime curve_name: []const u8) type {
             /// Constant-time scalar multiplication (use for secret scalars).
             /// Errors if the scalar is zero or the result is the identity.
             pub fn mul(self: Point, s: Scalar) error{IdentityElement}!Point {
+                if (comptime MulImpl) |M| return .{ .p = try M.mul(self.p, s.b, .big) };
                 return .{ .p = try self.p.mul(s.b, .big) };
             }
 
             /// Variable-time scalar multiplication for PUBLIC scalars only.
             pub fn mulPublic(self: Point, s: Scalar) error{ IdentityElement, NonCanonical }!Point {
+                if (comptime MulImpl) |M| return .{ .p = try M.mulPublic(self.p, s.b, .big) };
                 return .{ .p = try self.p.mulPublic(s.b, .big) };
             }
 
             /// Constant-time base-point multiplication.
             pub fn mulBase(s: Scalar) error{IdentityElement}!Point {
+                if (comptime MulImpl) |M| return .{ .p = try M.mul(C.basePoint, s.b, .big) };
                 return .{ .p = try C.basePoint.mul(s.b, .big) };
             }
 
             /// Variable-time a*P + b*Q for public inputs (verification equations).
             pub fn mulDoubleBasePublic(p1: Point, s1: Scalar, p2: Point, s2: Scalar) error{IdentityElement}!Point {
+                if (comptime MulImpl) |M| return .{ .p = try M.mulDoubleBasePublic(p1.p, s1.b, p2.p, s2.b, .big) };
                 return .{ .p = try C.mulDoubleBasePublic(p1.p, s1.b, p2.p, s2.b, .big) };
             }
 
@@ -218,16 +230,24 @@ fn WeierstrassCurve(comptime C: type, comptime curve_name: []const u8) type {
 /// wasm, and the reference the libsecp backend is tested against).
 pub const Secp256k1Std = WeierstrassCurve(crypto.ecc.Secp256k1, "secp256k1");
 
+/// The std backend with GLV endomorphism multiplication (`glv.zig`): pure
+/// Zig, same Scalar type and every non-multiplication operation as
+/// `Secp256k1Std`, roughly half the doublings per multiplication. The wasm
+/// build uses this, having no C to link.
+pub const Secp256k1Glv = WeierstrassCurveImpl(crypto.ecc.Secp256k1, "secp256k1", @import("glv.zig"));
+
 /// The secp256k1 every protocol actually uses. Selected at build time
-/// (`-Dsecp=std|libsecp` via the `secp_backend` module): either the std
-/// backend above, or bitcoin-core/libsecp256k1 behind the same declaration
-/// surface (`curve_libsecp.zig`). The two produce identical bytes for every
-/// operation, so artifacts and frames interoperate across backends; the
-/// difference is speed (libsecp multiplies ~4x faster) and the C dependency.
-pub const Secp256k1 = if (@import("secp_backend").use_libsecp)
-    @import("curve_libsecp.zig").Secp256k1
-else
-    Secp256k1Std;
+/// (`-Dsecp=std|glv|libsecp` via the `secp_backend` module): std.crypto as
+/// shipped, std.crypto with GLV multiplication, or bitcoin-core/libsecp256k1
+/// behind the same declaration surface (`curve_libsecp.zig`). All three
+/// produce identical bytes for every operation - tested op by op - so
+/// artifacts and frames interoperate across backends.
+pub const Secp256k1 = blk: {
+    const backend = @import("secp_backend");
+    if (backend.use_libsecp) break :blk @import("curve_libsecp.zig").Secp256k1;
+    if (backend.use_glv) break :blk Secp256k1Glv;
+    break :blk Secp256k1Std;
+};
 
 pub const P256 = WeierstrassCurve(crypto.ecc.P256, "p256");
 pub const P384 = WeierstrassCurve(crypto.ecc.P384, "p384");
@@ -466,8 +486,10 @@ test "bip340 x-only helpers (secp256k1)" {
 
 test {
     // The cross-backend equivalence tests live with the libsecp binding and
-    // only exist when that backend is compiled in.
+    // only exist when that backend is compiled in. The GLV backend is pure
+    // Zig and compares itself against std directly, so its tests always run.
     if (@import("secp_backend").use_libsecp) {
         _ = @import("curve_libsecp.zig");
     }
+    _ = @import("glv.zig");
 }
