@@ -19,6 +19,7 @@ const mpc = @import("zig_mpc");
 
 const cmd = @import("cmd.zig");
 const frame = @import("frame.zig");
+const ecdsa_cmd = @import("ecdsa.zig");
 const session = @import("session.zig");
 const suite_mod = @import("suite.zig");
 
@@ -100,62 +101,11 @@ fn runFor(
     };
 }
 
-fn header(s: *session.Session, round: u16) frame.Header {
-    return .{
-        .kind = .message,
-        .channel = .broadcast,
-        .protocol = .sign,
-        .suite = s.suite,
-        .round = round,
-        .from = s.manifest.party,
-        .n_parties = s.manifest.n_parties,
-        .threshold = s.manifest.threshold,
-        .session = s.id,
-    };
-}
-
 /// Load the key share this session signs with. The recorded path is stored
 /// exactly as it was given at init, so it is resolved against the current
 /// directory; `--share` overrides it.
-fn loadShare(
-    comptime E: type,
-    ctx: cmd.Ctx,
-    s: *session.Session,
-    override: ?[]const u8,
-) !mpc.dkg.Dkg(E).KeyShare {
-    const path = override orelse s.manifest.share_path orelse return error.NoKeyShare;
-    const f = try cmd.readFrame(ctx, path);
-    if (f.header.kind != .key_share) return error.WrongArtifactKind;
-    if (f.header.suite != s.suite) return error.SuiteMismatch;
-    const key = try mpc.serde.decodeSlice(mpc.dkg.Dkg(E).KeyShare, f.payload, .{ .gpa = ctx.gpa });
-    try key.validate();
-    return key;
-}
-
 fn loadMessage(ctx: cmd.Ctx, s: *session.Session) ![]const u8 {
     return cmd.readFileBytes(ctx, try s.artifactPath(message_file));
-}
-
-fn gather(ctx: cmd.Ctx, s: *session.Session, round: u16) !union(enum) {
-    ready: session.Inbox,
-    waiting: u8,
-} {
-    const inbox = s.scanInbox() catch |err| switch (err) {
-        error.Equivocation => {
-            try ctx.warn(
-                "refusing to continue: a signer sent two different messages for the\n" ++
-                    "same round. Inspect in/ before retrying.\n",
-                .{},
-            );
-            return .{ .waiting = cmd.Exit.protocol };
-        },
-        else => return err,
-    };
-    const reqs = try session.requirements(ctx.gpa, .sign, round, try s.participants(), s.manifest.party);
-    const missing = try inbox.missing(reqs);
-    if (missing.len > 0)
-        return .{ .waiting = try cmd.reportMissingWith(ctx, missing, inbox.rejected) };
-    return .{ .ready = inbox };
 }
 
 // ---------------------------------------------------------------------------
@@ -171,11 +121,11 @@ fn commit(
     const F = mpc.frost.Frost(suite_mod.FrostSuiteOf(tag).?);
     const E = F.E;
 
-    const key = try loadShare(E, ctx, s, share_override);
+    const key = (try cmd.loadKeyShare(E, ctx, s, share_override)).share;
     const msg = try loadMessage(ctx, s);
     const result = try F.commit(s.manifest.party, key.secret_share, ctx.rng);
 
-    _ = try s.emit(F.Commitment, result.commitment, header(s, 1), ctx.armor);
+    _ = try s.emit(F.Commitment, result.commitment, s.msgHeader(1, .broadcast, 0), ctx.armor);
     try s.saveState(Committed(F), .{
         .nonces = result.nonces,
         .commitment = result.commitment,
@@ -226,7 +176,7 @@ fn shareRound(
     const F = mpc.frost.Frost(suite_mod.FrostSuiteOf(tag).?);
     const E = F.E;
 
-    const gathered = try gather(ctx, s, 2);
+    const gathered = try cmd.gather(ctx, s, 2);
     const inbox = switch (gathered) {
         .waiting => |code| return code,
         .ready => |i| i,
@@ -245,7 +195,7 @@ fn shareRound(
         else => return err,
     };
 
-    const key = try loadShare(E, ctx, s, share_override);
+    const key = (try cmd.loadKeyShare(E, ctx, s, share_override)).share;
     const msg = try loadMessage(ctx, s);
 
     // These nonces were committed to for one specific message. Signing a
@@ -280,7 +230,7 @@ fn shareRound(
     // equations in one unknown, and the key share falls out.
     try s.consumeState(1);
 
-    _ = try s.emit(E.Scalar, sig_share, header(s, 2), ctx.armor);
+    _ = try s.emit(E.Scalar, sig_share, s.msgHeader(2, .broadcast, 0), ctx.armor);
     try s.saveState(Partial(F), .{ .commitment = state.commitment, .sig_share = sig_share }, 2);
     try s.advance(2);
 
@@ -301,14 +251,14 @@ fn aggregate(
     const F = mpc.frost.Frost(suite_mod.FrostSuiteOf(tag).?);
     const E = F.E;
 
-    const gathered = try gather(ctx, s, 3);
+    const gathered = try cmd.gather(ctx, s, 3);
     const inbox = switch (gathered) {
         .waiting => |code| return code,
         .ready => |i| i,
     };
 
     const own = try s.loadState(Partial(F), 2);
-    const key = try loadShare(E, ctx, s, share_override);
+    const key = (try cmd.loadKeyShare(E, ctx, s, share_override)).share;
     const msg = try loadMessage(ctx, s);
     const parties = try s.participants();
     const list = try commitmentList(F, ctx, s, inbox, own.commitment);
@@ -391,40 +341,12 @@ pub fn verify(
     };
 }
 
-/// Verify a secp256k1 ECDSA signature, hashing the message with SHA-256.
+/// Verify a plain ECDSA signature: hash the message the way signing did and
+/// hand off to the one shared verifier in `cli/ecdsa.zig`.
 fn verifyEcdsa(ctx: cmd.Ctx, pubkey_hex: []const u8, msg: []const u8, sig_bytes: []const u8) !u8 {
-    const E = mpc.curve.Secp256k1;
-    var pk_bytes: [E.Point.encoded_length]u8 = undefined;
-    cmd.hexExact(&pk_bytes, pubkey_hex) catch {
-        try ctx.warn("--pubkey must be {d} bytes of hex\n", .{E.Point.encoded_length});
-        return cmd.Exit.usage;
-    };
-    const pk = E.Point.fromBytes(pk_bytes) catch {
-        try ctx.warn("--pubkey is not a valid point\n", .{});
-        return cmd.Exit.bad_input;
-    };
-    if (sig_bytes.len != 64) {
-        try ctx.warn("an ECDSA signature here is 64 bytes (r||s); got {d}\n", .{sig_bytes.len});
-        return cmd.Exit.bad_input;
-    }
-
     var h: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(msg, &h, .{});
-    const r = E.Scalar.fromBytes(sig_bytes[0..32].*) catch {
-        try ctx.warn("signature is malformed\n", .{});
-        return cmd.Exit.bad_input;
-    };
-    const sc = E.Scalar.fromBytes(sig_bytes[32..64].*) catch {
-        try ctx.warn("signature is malformed\n", .{});
-        return cmd.Exit.bad_input;
-    };
-    if (!mpc.dkls.sign.verify(E, pk, h, .{ .r = r, .s = sc, .recovery_id = 0 })) {
-        try ctx.warn("signature is INVALID\n", .{});
-        return cmd.Exit.protocol;
-    }
-    try ctx.note("signature is valid\n", .{});
-    if (ctx.json) try ctx.emit("{{\"valid\":true}}\n", .{});
-    return cmd.Exit.ok;
+    return ecdsa_cmd.verify(ctx, pubkey_hex, h, sig_bytes);
 }
 
 fn verifyFor(

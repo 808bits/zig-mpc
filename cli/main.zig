@@ -319,7 +319,13 @@ fn cmdStatus(ctx: *cmd.Ctx, args: *Args) !u8 {
     }
     try ctx.emit("state     {d} round(s) done\n", .{m.round});
     if (step) |name| {
-        try ctx.emit("next      zmpc {s} {s}{s}\n", .{ m.protocol, name, try dirSuffix(ctx, args) });
+        // The dkls protocols are two words on the command line.
+        const words = switch (s.protocol) {
+            .dkls_setup => "dkls setup",
+            .dkls_sign => "dkls sign",
+            else => m.protocol,
+        };
+        try ctx.emit("next      zmpc {s} {s}{s}\n", .{ words, name, try dirSuffix(ctx, args) });
     } else {
         try ctx.emit("next      round {d}\n", .{next_round});
     }
@@ -1082,7 +1088,7 @@ fn cmdPull(ctx: *cmd.Ctx, args: *Args) !u8 {
 /// what we produced, pull what arrived, repeat.
 fn cmdNode(ctx: *cmd.Ctx, args: *Args) !u8 {
     try args.rejectUnknown(&.{
-        "dir",  "relay", "share", "aux", "primes", "poll-ms", "timeout-s",
+        "dir",  "relay", "share", "aux", "setup", "primes", "poll-ms", "timeout-s",
         "json", "quiet", "armor",
     });
     const relay_addr = try args.require("relay");

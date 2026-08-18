@@ -74,39 +74,6 @@ fn runFor(
     };
 }
 
-fn header(s: *session.Session, round: u16, channel: frame.Channel, to: u16) frame.Header {
-    return .{
-        .kind = .message,
-        .channel = channel,
-        .protocol = .auxgen,
-        .suite = s.suite,
-        .round = round,
-        .from = s.manifest.party,
-        .to = to,
-        .n_parties = s.manifest.n_parties,
-        .threshold = s.manifest.threshold,
-        .session = s.id,
-    };
-}
-
-fn gather(ctx: cmd.Ctx, s: *session.Session, round: u16) !union(enum) {
-    ready: session.Inbox,
-    waiting: u8,
-} {
-    const inbox = s.scanInbox() catch |err| switch (err) {
-        error.Equivocation => {
-            try ctx.warn("refusing to continue: a peer sent contradictory messages\n", .{});
-            return .{ .waiting = cmd.Exit.protocol };
-        },
-        else => return err,
-    };
-    const reqs = try session.requirements(ctx.gpa, .auxgen, round, try s.participants(), s.manifest.party);
-    const missing = try inbox.missing(reqs);
-    if (missing.len > 0)
-        return .{ .waiting = try cmd.reportMissingWith(ctx, missing, inbox.rejected) };
-    return .{ .ready = inbox };
-}
-
 // ---------------------------------------------------------------------------
 // prime generation (offline)
 // ---------------------------------------------------------------------------
@@ -246,7 +213,7 @@ fn round1(
         ctx.rng,
     );
 
-    _ = try s.emit(A.Round1Broadcast, result.broadcast, header(s, 1, .broadcast, 0), ctx.armor);
+    _ = try s.emit(A.Round1Broadcast, result.broadcast, s.msgHeader(1, .broadcast, 0), ctx.armor);
     try s.saveState(A.State1, result.state, 1);
     try s.advance(1);
 
@@ -257,7 +224,7 @@ fn round1(
 fn round2(comptime tag: suite_mod.Suite, ctx: cmd.Ctx, s: *session.Session) !u8 {
     const A = AuxOf(tag);
 
-    const gathered = try gather(ctx, s, 2);
+    const gathered = try cmd.gather(ctx, s, 2);
     const inbox = switch (gathered) {
         .waiting => |code| return code,
         .ready => |i| i,
@@ -276,7 +243,7 @@ fn round2(comptime tag: suite_mod.Suite, ctx: cmd.Ctx, s: *session.Session) !u8 
 
     const result = try A.round2(ctx.gpa, state, incoming);
 
-    _ = try s.emit(A.Round2Broadcast, result.broadcast, header(s, 2, .broadcast, 0), ctx.armor);
+    _ = try s.emit(A.Round2Broadcast, result.broadcast, s.msgHeader(2, .broadcast, 0), ctx.armor);
     try s.saveState(A.State2, result.state, 2);
     try s.advance(2);
 
@@ -287,7 +254,7 @@ fn round2(comptime tag: suite_mod.Suite, ctx: cmd.Ctx, s: *session.Session) !u8 
 fn round3(comptime tag: suite_mod.Suite, ctx: cmd.Ctx, s: *session.Session) !u8 {
     const A = AuxOf(tag);
 
-    const gathered = try gather(ctx, s, 3);
+    const gathered = try cmd.gather(ctx, s, 3);
     const inbox = switch (gathered) {
         .waiting => |code| return code,
         .ready => |i| i,
@@ -307,7 +274,7 @@ fn round3(comptime tag: suite_mod.Suite, ctx: cmd.Ctx, s: *session.Session) !u8 
     const result = A.round3(state, ctx.rng, incoming) catch |err| return cmd.protocolAbort(ctx, "aux-info generation", err, null);
 
     for (result.p2p) |out| {
-        _ = try s.emit(A.Round3P2p, out.msg, header(s, 3, .p2p, out.to), ctx.armor);
+        _ = try s.emit(A.Round3P2p, out.msg, s.msgHeader(3, .p2p, out.to), ctx.armor);
     }
     try s.saveState(A.State3, result.state, 3);
     try s.advance(3);
@@ -319,7 +286,7 @@ fn round3(comptime tag: suite_mod.Suite, ctx: cmd.Ctx, s: *session.Session) !u8 
 fn finalize(comptime tag: suite_mod.Suite, ctx: cmd.Ctx, s: *session.Session) !u8 {
     const A = AuxOf(tag);
 
-    const gathered = try gather(ctx, s, 4);
+    const gathered = try cmd.gather(ctx, s, 4);
     const inbox = switch (gathered) {
         .waiting => |code| return code,
         .ready => |i| i,

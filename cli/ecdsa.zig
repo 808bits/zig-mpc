@@ -84,39 +84,6 @@ fn runFor(
     };
 }
 
-fn header(s: *session.Session, round: u16, channel: frame.Channel, to: u16) frame.Header {
-    return .{
-        .kind = .message,
-        .channel = channel,
-        .protocol = .presign,
-        .suite = s.suite,
-        .round = round,
-        .from = s.manifest.party,
-        .to = to,
-        .n_parties = s.manifest.n_parties,
-        .threshold = s.manifest.threshold,
-        .session = s.id,
-    };
-}
-
-fn gather(ctx: cmd.Ctx, s: *session.Session, round: u16) !union(enum) {
-    ready: session.Inbox,
-    waiting: u8,
-} {
-    const inbox = s.scanInbox() catch |err| switch (err) {
-        error.Equivocation => {
-            try ctx.warn("refusing to continue: a signer sent contradictory messages\n", .{});
-            return .{ .waiting = cmd.Exit.protocol };
-        },
-        else => return err,
-    };
-    const reqs = try session.requirements(ctx.gpa, .presign, round, try s.participants(), s.manifest.party);
-    const missing = try inbox.missing(reqs);
-    if (missing.len > 0)
-        return .{ .waiting = try cmd.reportMissingWith(ctx, missing, inbox.rejected) };
-    return .{ .ready = inbox };
-}
-
 /// Collect messages tagged with the sender's *position in the signing set*,
 /// which is the numbering the library's rounds expect.
 fn collectPositional(
@@ -176,16 +143,7 @@ fn buildKeys(
     const A = mpc.auxgen.AuxGen(P, suite_mod.repetitionsOf(tag));
     const Pl = mpc.zk.common.Pail(P);
 
-    const share_path = paths.share orelse s.manifest.share_path orelse return error.NoKeyShare;
-    const share_frame = try cmd.readFrame(ctx, share_path);
-    if (share_frame.header.kind != .key_share) return error.WrongArtifactKind;
-    if (share_frame.header.suite != s.suite) return error.SuiteMismatch;
-    const key = try mpc.serde.decodeSlice(
-        mpc.dkg.Dkg(E).KeyShare,
-        share_frame.payload,
-        .{ .gpa = ctx.gpa },
-    );
-    try key.validate();
+    const key = (try cmd.loadKeyShare(E, ctx, s, paths.share)).share;
 
     const aux_path = paths.aux orelse s.manifest.aux_path orelse return error.NoAuxInfo;
     const aux_frame = try cmd.readFrame(ctx, aux_path);
@@ -240,10 +198,10 @@ fn round1(comptime tag: suite_mod.Suite, ctx: cmd.Ctx, s: *session.Session, path
     const keys = try buildKeys(tag, ctx, s, paths);
     const result = try T.round1(ctx.gpa, keys, ctx.rng);
 
-    _ = try s.emit(T.Round1aBroadcast, result.broadcast, header(s, 1, .broadcast, 0), ctx.armor);
+    _ = try s.emit(T.Round1aBroadcast, result.broadcast, s.msgHeader(1, .broadcast, 0), ctx.armor);
     for (result.p2p) |out| {
         const party = try partyAt(s, out.to);
-        _ = try s.emit(T.Round1bP2p, out.msg, header(s, 1, .p2p, party), ctx.armor);
+        _ = try s.emit(T.Round1bP2p, out.msg, s.msgHeader(1, .p2p, party), ctx.armor);
     }
     try s.saveState(T.State1, result.state, 1);
     try s.advance(1);
@@ -255,7 +213,7 @@ fn round1(comptime tag: suite_mod.Suite, ctx: cmd.Ctx, s: *session.Session, path
 fn round2(comptime tag: suite_mod.Suite, ctx: cmd.Ctx, s: *session.Session) !u8 {
     const T = EcdsaOf(tag);
 
-    const gathered = try gather(ctx, s, 2);
+    const gathered = try cmd.gather(ctx, s, 2);
     const inbox = switch (gathered) {
         .waiting => |code| return code,
         .ready => |i| i,
@@ -270,7 +228,7 @@ fn round2(comptime tag: suite_mod.Suite, ctx: cmd.Ctx, s: *session.Session) !u8 
 
     for (result.p2p) |out| {
         const party = try partyAt(s, out.to);
-        _ = try s.emit(T.Round2P2p, out.msg, header(s, 2, .p2p, party), ctx.armor);
+        _ = try s.emit(T.Round2P2p, out.msg, s.msgHeader(2, .p2p, party), ctx.armor);
     }
     try s.saveState(T.State2, result.state, 2);
     try s.advance(2);
@@ -282,7 +240,7 @@ fn round2(comptime tag: suite_mod.Suite, ctx: cmd.Ctx, s: *session.Session) !u8 
 fn round3(comptime tag: suite_mod.Suite, ctx: cmd.Ctx, s: *session.Session) !u8 {
     const T = EcdsaOf(tag);
 
-    const gathered = try gather(ctx, s, 3);
+    const gathered = try cmd.gather(ctx, s, 3);
     const inbox = switch (gathered) {
         .waiting => |code| return code,
         .ready => |i| i,
@@ -293,7 +251,7 @@ fn round3(comptime tag: suite_mod.Suite, ctx: cmd.Ctx, s: *session.Session) !u8 
 
     const result = T.round3(state, incoming, ctx.rng) catch |err| return cmd.protocolAbort(ctx, "presigning", err, null);
 
-    _ = try s.emit(T.Round3Broadcast, result.broadcast, header(s, 3, .broadcast, 0), ctx.armor);
+    _ = try s.emit(T.Round3Broadcast, result.broadcast, s.msgHeader(3, .broadcast, 0), ctx.armor);
     try s.saveState(T.State3, result.state, 3);
     try s.advance(3);
 
@@ -304,7 +262,7 @@ fn round3(comptime tag: suite_mod.Suite, ctx: cmd.Ctx, s: *session.Session) !u8 
 fn finalize(comptime tag: suite_mod.Suite, ctx: cmd.Ctx, s: *session.Session) !u8 {
     const T = EcdsaOf(tag);
 
-    const gathered = try gather(ctx, s, 4);
+    const gathered = try cmd.gather(ctx, s, 4);
     const inbox = switch (gathered) {
         .waiting => |code| return code,
         .ready => |i| i,
@@ -532,7 +490,6 @@ pub fn verify(
     sig_bytes: []const u8,
 ) !u8 {
     const E = mpc.curve.Secp256k1;
-    const T = mpc.ecdsa.Ecdsa(suite_mod.ParamsOf(.ecdsa_fast).?, E);
 
     if (sig_bytes.len != 64) {
         try ctx.warn("an ECDSA signature is 64 bytes (r || s); got {d}\n", .{sig_bytes.len});
@@ -548,18 +505,16 @@ pub fn verify(
         return cmd.Exit.bad_input;
     };
 
-    const sig = T.Signature{
-        .r = E.Scalar.fromBytes(sig_bytes[0..32].*) catch {
-            try ctx.warn("signature r is not a canonical scalar\n", .{});
-            return cmd.Exit.bad_input;
-        },
-        .s = E.Scalar.fromBytes(sig_bytes[32..64].*) catch {
-            try ctx.warn("signature s is not a canonical scalar\n", .{});
-            return cmd.Exit.bad_input;
-        },
+    const r = E.Scalar.fromBytes(sig_bytes[0..32].*) catch {
+        try ctx.warn("signature r is not a canonical scalar\n", .{});
+        return cmd.Exit.bad_input;
+    };
+    const sc = E.Scalar.fromBytes(sig_bytes[32..64].*) catch {
+        try ctx.warn("signature s is not a canonical scalar\n", .{});
+        return cmd.Exit.bad_input;
     };
 
-    if (!T.verify(pk, scalarFromDigest(E, digest), sig)) {
+    if (!mpc.ecdsa.verifySignature(E, pk, scalarFromDigest(E, digest), r, sc)) {
         try ctx.warn("signature is INVALID\n", .{});
         return cmd.Exit.protocol;
     }

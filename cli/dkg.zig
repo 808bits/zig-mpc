@@ -51,45 +51,7 @@ pub fn runAll(ctx: cmd.Ctx, s: *session.Session) !u8 {
     return cmd.Exit.ok;
 }
 
-fn header(s: *session.Session, round: u16, channel: frame.Channel, to: u16) frame.Header {
-    return .{
-        .kind = .message,
-        .channel = channel,
-        .protocol = .dkg,
-        .suite = s.suite,
-        .round = round,
-        .from = s.manifest.party,
-        .to = to,
-        .n_parties = s.manifest.n_parties,
-        .threshold = s.manifest.threshold,
-        .session = s.id,
-    };
-}
-
 /// Fetch this round's inputs, or explain what is still missing.
-fn gather(ctx: cmd.Ctx, s: *session.Session, round: u16) !union(enum) {
-    ready: session.Inbox,
-    waiting: u8,
-} {
-    const inbox = s.scanInbox() catch |err| switch (err) {
-        error.Equivocation => {
-            try ctx.warn(
-                "refusing to continue: two different messages arrived with the same\n" ++
-                    "round/sender/recipient. A peer is equivocating, or two runs were\n" ++
-                    "mixed in one directory. Inspect in/ before retrying.\n",
-                .{},
-            );
-            return .{ .waiting = cmd.Exit.protocol };
-        },
-        else => return err,
-    };
-    const reqs = try session.requirements(ctx.gpa, .dkg, round, try s.participants(), s.manifest.party);
-    const missing = try inbox.missing(reqs);
-    if (missing.len > 0)
-        return .{ .waiting = try cmd.reportMissingWith(ctx, missing, inbox.rejected) };
-    return .{ .ready = inbox };
-}
-
 fn round1(comptime E: type, ctx: cmd.Ctx, s: *session.Session) !u8 {
     const D = mpc.dkg.Dkg(E);
     const m = s.manifest;
@@ -100,7 +62,7 @@ fn round1(comptime E: type, ctx: cmd.Ctx, s: *session.Session) !u8 {
         .n = m.n_parties,
     }, mpc.dkg.ExecutionId.fromBytes(s.id), ctx.rng);
 
-    const name = try s.emit(D.Round1Broadcast, result.broadcast, header(s, 1, .broadcast, 0), ctx.armor);
+    const name = try s.emit(D.Round1Broadcast, result.broadcast, s.msgHeader(1, .broadcast, 0), ctx.armor);
     try s.saveState(D.State1, result.state, 1);
     try s.advance(1);
 
@@ -112,7 +74,7 @@ fn round2(comptime E: type, ctx: cmd.Ctx, s: *session.Session) !u8 {
     const D = mpc.dkg.Dkg(E);
     const m = s.manifest;
 
-    const gathered = try gather(ctx, s, 2);
+    const gathered = try cmd.gather(ctx, s, 2);
     const inbox = switch (gathered) {
         .waiting => |code| return code,
         .ready => |i| i,
@@ -123,9 +85,9 @@ fn round2(comptime E: type, ctx: cmd.Ctx, s: *session.Session) !u8 {
 
     const result = try D.round2(state, incoming);
 
-    _ = try s.emit(D.Round2Broadcast, result.broadcast, header(s, 2, .broadcast, 0), ctx.armor);
+    _ = try s.emit(D.Round2Broadcast, result.broadcast, s.msgHeader(2, .broadcast, 0), ctx.armor);
     for (result.p2p) |out| {
-        _ = try s.emit(D.Round2P2p, out.msg, header(s, 2, .p2p, out.to), ctx.armor);
+        _ = try s.emit(D.Round2P2p, out.msg, s.msgHeader(2, .p2p, out.to), ctx.armor);
     }
     try s.saveState(D.State2, result.state, 2);
     try s.advance(2);
@@ -138,7 +100,7 @@ fn round3(comptime E: type, ctx: cmd.Ctx, s: *session.Session) !u8 {
     const D = mpc.dkg.Dkg(E);
     const m = s.manifest;
 
-    const gathered = try gather(ctx, s, 3);
+    const gathered = try cmd.gather(ctx, s, 3);
     const inbox = switch (gathered) {
         .waiting => |code| return code,
         .ready => |i| i,
@@ -150,7 +112,7 @@ fn round3(comptime E: type, ctx: cmd.Ctx, s: *session.Session) !u8 {
 
     const result = D.round3(state, bc, p2p) catch |err| return cmd.protocolAbort(ctx, "key generation", err, null);
 
-    _ = try s.emit(D.Round3Broadcast, result.broadcast, header(s, 3, .broadcast, 0), ctx.armor);
+    _ = try s.emit(D.Round3Broadcast, result.broadcast, s.msgHeader(3, .broadcast, 0), ctx.armor);
     try s.saveState(D.State3, result.state, 3);
     try s.advance(3);
 
@@ -162,7 +124,7 @@ fn finalize(comptime E: type, ctx: cmd.Ctx, s: *session.Session) !u8 {
     const D = mpc.dkg.Dkg(E);
     const m = s.manifest;
 
-    const gathered = try gather(ctx, s, 4);
+    const gathered = try cmd.gather(ctx, s, 4);
     const inbox = switch (gathered) {
         .waiting => |code| return code,
         .ready => |i| i,

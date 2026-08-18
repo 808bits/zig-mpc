@@ -56,64 +56,10 @@ fn runFor(
     };
 }
 
-fn header(s: *session.Session, round: u16, channel: frame.Channel, to: u16) frame.Header {
-    return .{
-        .kind = .message,
-        .channel = channel,
-        .protocol = .refresh,
-        .suite = s.suite,
-        .round = round,
-        .from = s.manifest.party,
-        .to = to,
-        .n_parties = s.manifest.n_parties,
-        .threshold = s.manifest.threshold,
-        .session = s.id,
-    };
-}
-
-fn sharePath(s: *session.Session, override: ?[]const u8) ![]const u8 {
-    return override orelse s.manifest.share_path orelse error.NoKeyShare;
-}
-
-fn loadShare(comptime E: type, ctx: cmd.Ctx, s: *session.Session, override: ?[]const u8) !struct {
-    share: mpc.dkg.Dkg(E).KeyShare,
-    path: []const u8,
-} {
-    const path = try sharePath(s, override);
-    const f = try cmd.readFrame(ctx, path);
-    if (f.header.kind != .key_share) return error.WrongArtifactKind;
-    if (f.header.suite != s.suite) return error.SuiteMismatch;
-    const share = try mpc.serde.decodeSlice(
-        mpc.dkg.Dkg(E).KeyShare,
-        f.payload,
-        .{ .gpa = ctx.gpa },
-    );
-    try share.validate();
-    return .{ .share = share, .path = path };
-}
-
-fn gather(ctx: cmd.Ctx, s: *session.Session, round: u16) !union(enum) {
-    ready: session.Inbox,
-    waiting: u8,
-} {
-    const inbox = s.scanInbox() catch |err| switch (err) {
-        error.Equivocation => {
-            try ctx.warn("refusing to continue: a peer sent contradictory messages\n", .{});
-            return .{ .waiting = cmd.Exit.protocol };
-        },
-        else => return err,
-    };
-    const reqs = try session.requirements(ctx.gpa, .refresh, round, try s.participants(), s.manifest.party);
-    const missing = try inbox.missing(reqs);
-    if (missing.len > 0)
-        return .{ .waiting = try cmd.reportMissingWith(ctx, missing, inbox.rejected) };
-    return .{ .ready = inbox };
-}
-
 fn round1(comptime E: type, ctx: cmd.Ctx, s: *session.Session, share_override: ?[]const u8) !u8 {
     const R = mpc.refresh.Refresh(E);
 
-    const loaded = try loadShare(E, ctx, s, share_override);
+    const loaded = try cmd.loadKeyShare(E, ctx, s, share_override);
     const result = try R.round1(
         ctx.gpa,
         loaded.share,
@@ -121,7 +67,7 @@ fn round1(comptime E: type, ctx: cmd.Ctx, s: *session.Session, share_override: ?
         ctx.rng,
     );
 
-    _ = try s.emit(R.Round1Broadcast, result.broadcast, header(s, 1, .broadcast, 0), ctx.armor);
+    _ = try s.emit(R.Round1Broadcast, result.broadcast, s.msgHeader(1, .broadcast, 0), ctx.armor);
     try s.saveState(R.State1, result.state, 1);
     try s.advance(1);
 
@@ -132,7 +78,7 @@ fn round1(comptime E: type, ctx: cmd.Ctx, s: *session.Session, share_override: ?
 fn round2(comptime E: type, ctx: cmd.Ctx, s: *session.Session) !u8 {
     const R = mpc.refresh.Refresh(E);
 
-    const gathered = try gather(ctx, s, 2);
+    const gathered = try cmd.gather(ctx, s, 2);
     const inbox = switch (gathered) {
         .waiting => |code| return code,
         .ready => |i| i,
@@ -151,9 +97,9 @@ fn round2(comptime E: type, ctx: cmd.Ctx, s: *session.Session) !u8 {
 
     const result = try R.round2(state, incoming);
 
-    _ = try s.emit(R.Round2Broadcast, result.broadcast, header(s, 2, .broadcast, 0), ctx.armor);
+    _ = try s.emit(R.Round2Broadcast, result.broadcast, s.msgHeader(2, .broadcast, 0), ctx.armor);
     for (result.p2p) |out| {
-        _ = try s.emit(R.Round2P2p, out.msg, header(s, 2, .p2p, out.to), ctx.armor);
+        _ = try s.emit(R.Round2P2p, out.msg, s.msgHeader(2, .p2p, out.to), ctx.armor);
     }
     try s.saveState(R.State2, result.state, 2);
     try s.advance(2);
@@ -166,7 +112,7 @@ fn finalize(comptime E: type, ctx: cmd.Ctx, s: *session.Session, share_override:
     const D = mpc.dkg.Dkg(E);
     const R = mpc.refresh.Refresh(E);
 
-    const gathered = try gather(ctx, s, 3);
+    const gathered = try cmd.gather(ctx, s, 3);
     const inbox = switch (gathered) {
         .waiting => |code| return code,
         .ready => |i| i,
@@ -192,7 +138,7 @@ fn finalize(comptime E: type, ctx: cmd.Ctx, s: *session.Session, share_override:
         s.manifest.party,
     );
 
-    const loaded = try loadShare(E, ctx, s, share_override);
+    const loaded = try cmd.loadKeyShare(E, ctx, s, share_override);
     var share = loaded.share;
     const pk_before = share.public_key;
     const old_secret = share.secret_share;

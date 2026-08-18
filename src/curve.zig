@@ -95,6 +95,23 @@ fn WeierstrassCurve(comptime C: type, comptime curve_name: []const u8) type {
                 return crypto.timing_safe.eql([encoded_length]u8, x.b, zero.b);
             }
 
+            /// Whether the scalar exceeds half the group order. ECDSA's low-s
+            /// rule (BIP-62) negates such an `s`; both threshold ECDSA
+            /// implementations here normalize with this.
+            pub fn isHigh(x: Scalar) bool {
+                const half = comptime blk: {
+                    var h = order_be;
+                    var carry: u8 = 0;
+                    for (&h) |*b| {
+                        const next: u8 = b.* & 1;
+                        b.* = (carry << 7) | (b.* >> 1);
+                        carry = next;
+                    }
+                    break :blk h;
+                };
+                return std.mem.order(u8, &x.b, &half) == .gt;
+            }
+
             pub fn eql(x: Scalar, y: Scalar) bool {
                 return crypto.timing_safe.eql([encoded_length]u8, x.b, y.b);
             }
@@ -160,6 +177,16 @@ fn WeierstrassCurve(comptime C: type, comptime curve_name: []const u8) type {
             pub fn isIdentity(a: Point) bool {
                 a.p.rejectIdentity() catch return true;
                 return false;
+            }
+
+            /// x-coordinate reduced into a scalar: ECDSA's `r`. The field
+            /// order exceeds the group order on these curves, so this is a
+            /// genuine (if rare) reduction, and the value is public.
+            pub fn xScalar(self: Point) Scalar {
+                const x = self.xOnly();
+                var wide: [64]u8 = @splat(0);
+                @memcpy(wide[64 - x.len ..], &x);
+                return Scalar.fromWideBytes(wide);
             }
 
             /// BIP-340 helpers (meaningful on secp256k1).

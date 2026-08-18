@@ -158,6 +158,23 @@ pub const Session = struct {
     }
 
     /// Record that `round` finished, so `status` and `run` know where we are.
+    /// The frame header for a round message of this session's own protocol.
+    /// `to` is 0 for a broadcast.
+    pub fn msgHeader(self: *Session, round: u16, channel: frame.Channel, to: u16) frame.Header {
+        return .{
+            .kind = .message,
+            .channel = channel,
+            .protocol = self.protocol,
+            .suite = self.suite,
+            .round = round,
+            .from = self.manifest.party,
+            .to = to,
+            .n_parties = self.manifest.n_parties,
+            .threshold = self.manifest.threshold,
+            .session = self.id,
+        };
+    }
+
     pub fn advance(self: *Session, round: u16) !void {
         self.manifest.round = round;
         try self.saveManifest();
@@ -592,7 +609,16 @@ pub fn requirements(
                 }
             },
             .sign => try out.append(gpa, .{ .round = prev, .channel = .broadcast, .from = j }),
-            .dkls_setup => try out.append(gpa, .{ .round = prev, .channel = .p2p, .from = j, .to = me }),
+            .dkls_setup => {
+                // Round 2 only opens commitments and gathers nothing, so
+                // finalize is the first consumer of round 1's messages too.
+                // It must wait for both, or a slow round-1 frame turns into a
+                // hard decode error instead of a "waiting" exit.
+                var r: u16 = 1;
+                while (r <= prev) : (r += 1) {
+                    try out.append(gpa, .{ .round = r, .channel = .p2p, .from = j, .to = me });
+                }
+            },
             .dkls_sign => {
                 // Phases 1 and 2 are point-to-point; phase 3 broadcasts the
                 // two scalars every party combines.
@@ -648,6 +674,12 @@ test "step names match the subcommands each protocol accepts" {
     try testing.expect(stepName(.refresh, 4) == null);
 
     // Signing names its rounds after what they do.
+    try testing.expectEqualStrings("round1", stepName(.dkls_setup, 1).?);
+    try testing.expectEqualStrings("finalize", stepName(.dkls_setup, 3).?);
+    try testing.expect(stepName(.dkls_setup, 4) == null);
+    try testing.expectEqualStrings("phase1", stepName(.dkls_sign, 1).?);
+    try testing.expectEqualStrings("finalize", stepName(.dkls_sign, 4).?);
+
     try testing.expectEqualStrings("commit", stepName(.sign, 1).?);
     try testing.expectEqualStrings("share", stepName(.sign, 2).?);
     try testing.expectEqualStrings("aggregate", stepName(.sign, 3).?);

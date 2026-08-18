@@ -111,6 +111,48 @@ fn abortTail(ctx: Ctx, a: mpc.abort.Abort) !u8 {
     return Exit.protocol;
 }
 
+/// Scan the inbox and check it against what `round` of this session's
+/// protocol consumes. Every round of every protocol starts exactly this way,
+/// so the equivocation refusal and the missing-frame report live here once.
+pub fn gather(ctx: Ctx, s: *session.Session, round: u16) !union(enum) {
+    ready: session.Inbox,
+    waiting: u8,
+} {
+    const inbox = s.scanInbox() catch |err| switch (err) {
+        error.Equivocation => {
+            try ctx.warn(
+                "refusing to continue: two different messages arrived with the same\n" ++
+                    "round/sender/recipient. A peer is equivocating, or two runs were\n" ++
+                    "mixed in one directory. Inspect in/ before retrying.\n",
+                .{},
+            );
+            return .{ .waiting = Exit.protocol };
+        },
+        else => return err,
+    };
+    const reqs = try session.requirements(ctx.gpa, s.protocol, round, try s.participants(), s.manifest.party);
+    const missing = try inbox.missing(reqs);
+    if (missing.len > 0)
+        return .{ .waiting = try reportMissingWith(ctx, missing, inbox.rejected) };
+    return .{ .ready = inbox };
+}
+
+/// Load and validate the key share a session works with: `override` wins,
+/// then the path recorded at init. The suite check is what stops a share from
+/// one ceremony being quietly signed with by another.
+pub fn loadKeyShare(comptime E: type, ctx: Ctx, s: *session.Session, override: ?[]const u8) !struct {
+    share: mpc.dkg.Dkg(E).KeyShare,
+    path: []const u8,
+} {
+    const path = override orelse s.manifest.share_path orelse return error.NoKeyShare;
+    const f = try readFrame(ctx, path);
+    if (f.header.kind != .key_share) return error.WrongArtifactKind;
+    if (f.header.suite != s.suite) return error.SuiteMismatch;
+    const share = try mpc.serde.decodeSlice(mpc.dkg.Dkg(E).KeyShare, f.payload, .{ .gpa = ctx.gpa });
+    try share.validate();
+    return .{ .share = share, .path = path };
+}
+
 /// Print a command's whole help page and return the usage exit code.
 ///
 /// Reached whenever a command was given too little to act on: no step, or a

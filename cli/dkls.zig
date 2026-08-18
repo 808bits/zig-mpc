@@ -28,7 +28,6 @@ const mpc = @import("zig_mpc");
 const cmd = @import("cmd.zig");
 const frame = @import("frame.zig");
 const session = @import("session.zig");
-const suite_mod = @import("suite.zig");
 
 pub const setup_file = "dkls-setup.zmpc";
 pub const signature_file = "signature.bin";
@@ -53,38 +52,6 @@ fn requireDkls(ctx: cmd.Ctx, s: *session.Session) !bool {
     return false;
 }
 
-fn header(s: *session.Session, protocol: frame.Protocol, round: u16, channel: frame.Channel, to: u16) frame.Header {
-    return .{
-        .kind = .message,
-        .channel = channel,
-        .protocol = protocol,
-        .suite = s.suite,
-        .round = round,
-        .from = s.manifest.party,
-        .to = to,
-        .n_parties = s.manifest.n_parties,
-        .threshold = s.manifest.threshold,
-        .session = s.id,
-    };
-}
-
-fn gather(ctx: cmd.Ctx, s: *session.Session, protocol: frame.Protocol, round: u16) !union(enum) {
-    ready: session.Inbox,
-    waiting: u8,
-} {
-    const inbox = s.scanInbox() catch |err| switch (err) {
-        error.Equivocation => {
-            try ctx.warn("refusing to continue: a peer sent contradictory messages\n", .{});
-            return .{ .waiting = cmd.Exit.protocol };
-        },
-        else => return err,
-    };
-    const reqs = try session.requirements(ctx.gpa, protocol, round, try s.participants(), s.manifest.party);
-    const missing = try inbox.missing(reqs);
-    if (missing.len > 0) return .{ .waiting = try cmd.reportMissingWith(ctx, missing, inbox.rejected) };
-    return .{ .ready = inbox };
-}
-
 /// The counterparties of this party within `participants`, ascending.
 fn counterpartiesOf(ctx: cmd.Ctx, s: *session.Session) ![]u16 {
     const all = try s.participants();
@@ -96,16 +63,6 @@ fn counterpartiesOf(ctx: cmd.Ctx, s: *session.Session) ![]u16 {
         k += 1;
     }
     return out;
-}
-
-fn loadShare(ctx: cmd.Ctx, s: *session.Session, override: ?[]const u8) !mpc.dkg.Dkg(E).KeyShare {
-    const path = override orelse s.manifest.share_path orelse return error.NoKeyShare;
-    const f = try cmd.readFrame(ctx, path);
-    if (f.header.kind != .key_share) return error.WrongArtifactKind;
-    if (f.header.suite != s.suite) return error.SuiteMismatch;
-    const share = try mpc.serde.decodeSlice(mpc.dkg.Dkg(E).KeyShare, f.payload, .{ .gpa = ctx.gpa });
-    try share.validate();
-    return share;
 }
 
 // ---------------------------------------------------------------------------
@@ -222,7 +179,7 @@ fn setupRound1(ctx: cmd.Ctx, s: *session.Session) !u8 {
     defer ctx.gpa.free(cps);
 
     for (cps, 0..) |cp, i| {
-        _ = try s.emit(mpc.dkls.setup.Round1(E), out.messages[i], header(s, .dkls_setup, 1, .p2p, cp), ctx.armor);
+        _ = try s.emit(mpc.dkls.setup.Round1(E), out.messages[i], s.msgHeader(1, .p2p, cp), ctx.armor);
     }
     try s.saveState(Setup.State1, out.state, 1);
     try s.advance(1);
@@ -238,7 +195,7 @@ fn setupRound2(ctx: cmd.Ctx, s: *session.Session) !u8 {
     defer ctx.gpa.free(cps);
 
     for (cps, 0..) |cp, i| {
-        _ = try s.emit(mpc.dkls.setup.Round2(E), out.messages[i], header(s, .dkls_setup, 2, .p2p, cp), ctx.armor);
+        _ = try s.emit(mpc.dkls.setup.Round2(E), out.messages[i], s.msgHeader(2, .p2p, cp), ctx.armor);
     }
     try s.advance(2);
 
@@ -247,7 +204,7 @@ fn setupRound2(ctx: cmd.Ctx, s: *session.Session) !u8 {
 }
 
 fn setupFinalize(ctx: cmd.Ctx, s: *session.Session, share_override: ?[]const u8) !u8 {
-    const gathered = try gather(ctx, s, .dkls_setup, 3);
+    const gathered = try cmd.gather(ctx, s, 3);
     const inbox = switch (gathered) {
         .waiting => |code| return code,
         .ready => |i| i,
@@ -265,7 +222,7 @@ fn setupFinalize(ctx: cmd.Ctx, s: *session.Session, share_override: ?[]const u8)
         r2[i] = try inbox.decode(mpc.dkls.setup.Round2(E), .{ .round = 2, .channel = .p2p, .from = cp, .to = s.manifest.party });
     }
 
-    const key = try loadShare(ctx, s, share_override);
+    const key = (try cmd.loadKeyShare(E, ctx, s, share_override)).share;
     const params = mpc.dkls.sign.Params{
         .party = s.manifest.party,
         .n = s.manifest.n_parties,
@@ -328,7 +285,7 @@ pub fn signRunAll(ctx: cmd.Ctx, s: *session.Session, paths: Paths) !u8 {
 }
 
 fn loadParty(ctx: cmd.Ctx, s: *session.Session, paths: Paths) !mpc.dkls.sign.Party(E) {
-    const key = try loadShare(ctx, s, paths.share);
+    const key = (try cmd.loadKeyShare(E, ctx, s, paths.share)).share;
     const path = paths.setup orelse s.manifest.aux_path orelse return error.NoSetup;
     const loaded = try cmd.readArtifact(ctx, StoredSetup, path, .dkls_setup);
     return restoreParty(ctx.gpa, loaded.value, .{
@@ -339,13 +296,12 @@ fn loadParty(ctx: cmd.Ctx, s: *session.Session, paths: Paths) !mpc.dkls.sign.Par
 }
 
 fn signData(ctx: cmd.Ctx, s: *session.Session) !mpc.dkls.sign.SignData {
-    const digest = try cmd.readFileBytes(ctx, try s.artifactPath("message.bin"));
+    // Always SHA-256, whatever the length: `zmpc verify` hashes the message
+    // the same way, so signing and verification agree by construction. (A
+    // 32-byte message is a message, not a precomputed digest.)
+    const msg = try cmd.readFileBytes(ctx, try s.artifactPath("message.bin"));
     var h: [32]u8 = undefined;
-    if (digest.len == 32) {
-        @memcpy(&h, digest);
-    } else {
-        std.crypto.hash.sha2.Sha256.hash(digest, &h, .{});
-    }
+    std.crypto.hash.sha2.Sha256.hash(msg, &h, .{});
     return .{ .sign_id = s.id, .quorum = try s.participants(), .message_hash = h };
 }
 
@@ -359,7 +315,7 @@ fn signPhase1(ctx: cmd.Ctx, s: *session.Session, paths: Paths) !u8 {
     const cps = try counterpartiesOf(ctx, s);
     defer ctx.gpa.free(cps);
     for (cps, 0..) |cp, i| {
-        _ = try s.emit(mpc.dkls.sign.Round1(E), out.messages[i], header(s, .dkls_sign, 1, .p2p, cp), ctx.armor);
+        _ = try s.emit(mpc.dkls.sign.Round1(E), out.messages[i], s.msgHeader(1, .p2p, cp), ctx.armor);
     }
     try s.saveState(Signer.State1, out.state, 1);
     try s.advance(1);
@@ -369,7 +325,7 @@ fn signPhase1(ctx: cmd.Ctx, s: *session.Session, paths: Paths) !u8 {
 }
 
 fn signPhase2(ctx: cmd.Ctx, s: *session.Session, paths: Paths) !u8 {
-    const gathered = try gather(ctx, s, .dkls_sign, 2);
+    const gathered = try cmd.gather(ctx, s, 2);
     const inbox = switch (gathered) {
         .waiting => |code| return code,
         .ready => |i| i,
@@ -391,7 +347,7 @@ fn signPhase2(ctx: cmd.Ctx, s: *session.Session, paths: Paths) !u8 {
         return cmd.protocolAbort(ctx, "dkls signing", err, null);
 
     for (cps, 0..) |cp, i| {
-        _ = try s.emit(mpc.dkls.sign.Round2(E), out.messages[i], header(s, .dkls_sign, 2, .p2p, cp), ctx.armor);
+        _ = try s.emit(mpc.dkls.sign.Round2(E), out.messages[i], s.msgHeader(2, .p2p, cp), ctx.armor);
     }
     try s.saveState(Signer.State2, out.state, 2);
     try s.advance(2);
@@ -401,7 +357,7 @@ fn signPhase2(ctx: cmd.Ctx, s: *session.Session, paths: Paths) !u8 {
 }
 
 fn signPhase3(ctx: cmd.Ctx, s: *session.Session, paths: Paths) !u8 {
-    const gathered = try gather(ctx, s, .dkls_sign, 3);
+    const gathered = try cmd.gather(ctx, s, 3);
     const inbox = switch (gathered) {
         .waiting => |code| return code,
         .ready => |i| i,
@@ -422,7 +378,7 @@ fn signPhase3(ctx: cmd.Ctx, s: *session.Session, paths: Paths) !u8 {
     const out = Signer.phase3(ctx.gpa, party, data, &state, cps, msgs) catch |err|
         return cmd.protocolAbort(ctx, "dkls signing", err, null);
 
-    _ = try s.emit(mpc.dkls.sign.Round3(E), out.broadcast, header(s, .dkls_sign, 3, .broadcast, 0), ctx.armor);
+    _ = try s.emit(mpc.dkls.sign.Round3(E), out.broadcast, s.msgHeader(3, .broadcast, 0), ctx.armor);
     try s.saveState(Signer.Out3, out, 3);
     try s.advance(3);
 
@@ -431,7 +387,7 @@ fn signPhase3(ctx: cmd.Ctx, s: *session.Session, paths: Paths) !u8 {
 }
 
 fn signFinalize(ctx: cmd.Ctx, s: *session.Session, paths: Paths) !u8 {
-    const gathered = try gather(ctx, s, .dkls_sign, 4);
+    const gathered = try cmd.gather(ctx, s, 4);
     const inbox = switch (gathered) {
         .waiting => |code| return code,
         .ready => |i| i,

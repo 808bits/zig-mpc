@@ -423,7 +423,9 @@ for r in round1 round2 finalize; do
 done
 ok "pairwise setup complete for all three parties"
 
-printf 'pay alice 1 BTC' > dtx.bin
+# Exactly 32 bytes: a signer must treat this as a message to hash, never as
+# a precomputed digest, or verification fails.
+printf 'exactly thirty-two bytes long!!!' > dtx.bin
 SIDV=$("$ZMPC" dkls sign init --dir m1 --share d1/artifacts/keyshare.zmpc \
       --setup k1/artifacts/dkls-setup.zmpc --signers 1,3 --msg-file dtx.bin --quiet)
 "$ZMPC" dkls sign init --dir m3 --share d3/artifacts/keyshare.zmpc \

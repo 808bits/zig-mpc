@@ -39,6 +39,8 @@ const Allocator = std.mem.Allocator;
 const hash = @import("hash.zig");
 const mul = @import("mul.zig");
 const zeroshare = @import("zeroshare.zig");
+const vss = @import("../vss.zig");
+const ecdsa = @import("../ecdsa.zig");
 
 pub const Error = error{
     /// The quorum does not match the key share, or contains this party twice.
@@ -188,56 +190,13 @@ fn zeroSessionId(buf: *std.ArrayList(u8), gpa: Allocator, execution_id: [32]u8, 
     return buf.items;
 }
 
-/// x-coordinate of a point, reduced into a scalar. This is the signature's `r`.
-fn scalarFromX(comptime E: type, p: E.Point) E.Scalar {
-    const x = p.xOnly();
-    var wide: [64]u8 = @splat(0);
-    @memcpy(wide[64 - x.len ..], &x);
-    return E.Scalar.fromWideBytes(wide);
-}
-
-/// Lagrange coefficient taking this party's Shamir share to its additive share
-/// for `quorum`, evaluated at zero.
-fn lagrange(comptime E: type, self_index: u16, counterparties: []const u16) E.Scalar {
-    var num = E.Scalar.one;
-    var den = E.Scalar.one;
-    const xi = E.Scalar.fromU64(self_index);
-    for (counterparties) |j| {
-        const xj = E.Scalar.fromU64(j);
-        num = num.mul(xj);
-        den = den.mul(xj.sub(xi));
-    }
-    return num.mul(den.invert());
-}
-
-fn normalizeS(comptime E: type, s: E.Scalar) E.Scalar {
-    const half = comptime blk: {
-        var h = E.order_be;
-        var carry: u8 = 0;
-        for (&h) |*b| {
-            const next: u8 = b.* & 1;
-            b.* = (carry << 7) | (b.* >> 1);
-            carry = next;
-        }
-        break :blk h;
-    };
-    const be = s.toBytes();
-    if (std.mem.order(u8, &be, &half) == .gt) return s.neg();
-    return s;
-}
-
-/// Textbook ECDSA verification, used as the final gate before a signature is
-/// returned. A share that is wrong in a way the per-counterparty checks miss
-/// still cannot escape as a valid-looking signature.
+/// ECDSA verification against a 32-byte message hash: the shared textbook
+/// implementation in `ecdsa.zig`, with the reduction this module uses. Used as
+/// the final gate before a signature is returned, so a share that is wrong in
+/// a way the per-counterparty checks miss still cannot escape as a
+/// valid-looking signature.
 pub fn verify(comptime E: type, pk: E.Point, message_hash: [32]u8, sig: Signature(E)) bool {
-    if (sig.r.isZero() or sig.s.isZero()) return false;
-    const m = hash.reduceToScalar(E, message_hash);
-    const s_inv = sig.s.invert();
-    const a = m.mul(s_inv);
-    const b = sig.r.mul(s_inv);
-    const p = E.Point.mulDoubleBasePublic(E.Point.generator, a, pk, b) catch return false;
-    if (p.isIdentity()) return false;
-    return scalarFromX(E, p).eql(sig.r);
+    return ecdsa.verifySignature(E, pk, hash.reduceToScalar(E, message_hash), sig.r, sig.s);
 }
 
 // ---------------------------------------------------------------------------
@@ -450,7 +409,8 @@ pub fn Signer(comptime E: type) type {
             // The quorum-specific additive share: the Shamir share scaled by its
             // Lagrange coefficient, re-randomized by the share of zero so no
             // individual public share leaks anything about the key.
-            const l = lagrange(E, party.params.party, cps);
+            const my_pos = std.mem.indexOfScalar(u16, data.quorum, party.params.party).?;
+            const l = vss.lagrangeAtZero(E, data.quorum, my_pos) catch return error.InvalidQuorum;
             const key_share = party.key_share.mul(l).add(state.zeta);
             const public_share = E.Point.mulBase(key_share) catch return error.PublicKeyMismatch;
             const input = [_]E.Scalar{ state.instance_key, key_share };
@@ -460,9 +420,22 @@ pub fn Signer(comptime E: type) type {
             const messages = try gpa.alloc(Round2(E), cps.len);
             errdefer gpa.free(messages);
 
+            // `handled` catches duplicates as soon as a sender repeats;
+            // `built` marks slots whose entry (and moved multiplication
+            // state) actually exists, so the error path below frees exactly
+            // what this function came to own and nothing it did not.
             var handled = try gpa.alloc(bool, cps.len);
             defer gpa.free(handled);
             @memset(handled, false);
+            var built = try gpa.alloc(bool, cps.len);
+            defer gpa.free(built);
+            @memset(built, false);
+            errdefer for (built, 0..) |done, i| {
+                if (done) {
+                    kept[i].mul_kept.deinit(gpa);
+                    messages[i].mul_reply.deinit(gpa);
+                }
+            };
 
             for (from, received) |sender, msg| {
                 const slot = std.mem.indexOfScalar(u16, cps, sender) orelse return error.UnexpectedSender;
@@ -496,6 +469,7 @@ pub fn Signer(comptime E: type) type {
                     .salt = k1.salt,
                     .mul_reply = sent.to_receiver,
                 };
+                built[slot] = true;
             }
 
             return .{
@@ -584,7 +558,7 @@ pub fn Signer(comptime E: type) type {
             if (!expected_pk.eql(party.public_key)) return error.PublicKeyMismatch;
             if (nonce_point.isIdentity()) return error.TrivialNonce;
 
-            const r = scalarFromX(E, nonce_point);
+            const r = nonce_point.xScalar();
             const m = hash.reduceToScalar(E, data.message_hash);
 
             const u = state.instance_key.mul(mask_sum).add(sum_u);
@@ -614,7 +588,8 @@ pub fn Signer(comptime E: type) type {
             }
             if (denominator.isZero()) return error.ZeroDenominator;
 
-            const s = normalizeS(E, numerator.mul(denominator.invert()));
+            const raw_s = numerator.mul(denominator.invert());
+            const s = if (raw_s.isHigh()) raw_s.neg() else raw_s;
             if (s.isZero()) return error.SignatureInvalid;
 
             // Recovery id, from the nonce point every party agreed on.
@@ -623,7 +598,6 @@ pub fn Signer(comptime E: type) type {
             var rec: u8 = if (out3.nonce_point.hasEvenY()) 0 else 1;
             if (x_was_reduced) rec |= 2;
             // Normalizing s flips the nonce point's parity.
-            const raw_s = numerator.mul(denominator.invert());
             if (!raw_s.eql(s)) rec ^= 1;
 
             const sig = Signature(E){ .r = out3.r, .s = s, .recovery_id = rec };
@@ -984,4 +958,35 @@ test "quorum validation rejects malformed inputs" {
     const too_many = [_]u16{ 1, 2, 3 };
     try testing.expectError(error.InvalidQuorum, S.phase1(gpa, dealt.parties[0], .{ .sign_id = @splat(0), .quorum = &too_many, .message_hash = h }, rng));
     h = @splat(0);
+}
+
+test "phase 2 frees moved state when a later message is rejected" {
+    // Phase 2 takes ownership of phase 1's per-counterparty multiplication
+    // state one message at a time. A malformed message after a successful one
+    // must not leak what was already moved; testing.allocator is the proof.
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init(@splat(58));
+    const rng = prng.random();
+
+    const dealt = try dealParties(gpa, 3, 3, rng);
+    defer freeParties(gpa, dealt.parties);
+    const S = Signer(K1);
+    const quorum = [_]u16{ 1, 2, 3 };
+    var h: [32]u8 = @splat(3);
+    const data = SignData{ .sign_id = @splat(0x5A), .quorum = &quorum, .message_hash = h };
+    h = @splat(0);
+
+    var a1 = try S.phase1(gpa, dealt.parties[0], data, rng);
+    defer a1.deinit(gpa);
+    var b1 = try S.phase1(gpa, dealt.parties[1], data, rng);
+    defer b1.deinit(gpa);
+
+    // Party 2's message delivered twice: the first move succeeds, the
+    // duplicate is rejected, and the errdefer must release the moved half.
+    const from = [_]u16{ 2, 2 };
+    const msgs = [_]Round1(K1){ b1.messages[0], b1.messages[0] };
+    try testing.expectError(
+        error.DuplicateSender,
+        S.phase2(gpa, dealt.parties[0], data, &a1.state, &from, &msgs, rng),
+    );
 }

@@ -95,10 +95,6 @@ pub fn canSign(s: Suite) bool {
     };
 }
 
-pub fn isDkls(s: Suite) bool {
-    return s == .dkls;
-}
-
 pub fn parse(text: []const u8) ?Suite {
     return std.meta.stringToEnum(Suite, text);
 }

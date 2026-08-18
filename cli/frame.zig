@@ -64,6 +64,7 @@ pub const Protocol = enum(u16) {
     dkls_setup = 7,
     dkls_sign = 8,
     /// Artifacts and relay control frames belong to no round protocol.
+    /// (6 rather than last-in-line: it predates the dkls protocols.)
     none = 6,
 };
 

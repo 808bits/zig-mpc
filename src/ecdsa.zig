@@ -25,6 +25,26 @@ const common = zk.common;
 const Transcript = transcript.Transcript;
 pub const ExecutionId = transcript.ExecutionId;
 
+/// Textbook ECDSA verification, the way any outside verifier computes it.
+///
+/// This is the one implementation shared by the CGGMP24 and DKLs23 suites and
+/// by every CLI verify path: a signature either protocol produces is a plain
+/// ECDSA signature, so there is exactly one definition of "valid".
+pub fn verifySignature(comptime E: type, pk: E.Point, msg_scalar: E.Scalar, r: E.Scalar, s: E.Scalar) bool {
+    if (r.isZero() or s.isZero()) return false;
+    const s_inv = s.invert();
+    const ua = msg_scalar.mul(s_inv);
+    const ub = r.mul(s_inv);
+    const rp = blk: {
+        // ua is zero only when the message hash reduces to zero; the double
+        // base multiply rejects zero scalars, so take the single-mul path.
+        if (ua.isZero()) break :blk common.pointMulPub(E, pk, ub);
+        break :blk E.Point.mulDoubleBasePublic(E.Point.generator, ua, pk, ub) catch return false;
+    };
+    if (rp.isIdentity()) return false;
+    return rp.xScalar().eql(r);
+}
+
 pub fn Ecdsa(comptime P: type, comptime E: type) type {
     comptime std.debug.assert(E.scalar_endian == .big); // Weierstrass curves only
     const Pl = common.Pail(P);
@@ -187,14 +207,6 @@ pub fn Ecdsa(comptime P: type, comptime E: type) type {
             }
             const mag = P.Fn.sub(dk.ek.n, m);
             return (S{ .neg = true, .mag = P.lift(P.Fn, mag) }).canonPub();
-        }
-
-        /// x-coordinate of a point reduced into a scalar.
-        fn scalarFromX(pt: E.Point) E.Scalar {
-            const x_bytes = pt.xOnly();
-            var wide: [64]u8 = @splat(0);
-            @memcpy(wide[64 - x_bytes.len ..], &x_bytes);
-            return E.Scalar.fromWideBytes(wide);
         }
 
         fn encTranscript(eid: ExecutionId, prover: u16, num: u8) Transcript {
@@ -656,7 +668,7 @@ pub fn Ecdsa(comptime P: type, comptime E: type) type {
         // ------------------------------------------------------------------
 
         pub fn partialSign(presig: Presignature, msg_scalar: E.Scalar) E.Scalar {
-            const r = scalarFromX(presig.gamma);
+            const r = presig.gamma.xScalar();
             return presig.tilde_k.mul(msg_scalar).add(r.mul(presig.tilde_chi));
         }
 
@@ -665,7 +677,7 @@ pub fn Ecdsa(comptime P: type, comptime E: type) type {
         pub fn combine(gamma: E.Point, partials: []const E.Scalar, msg_scalar: E.Scalar) !Signature {
             _ = msg_scalar;
             if (partials.len == 0) return error.NoPartialSignatures;
-            const r = scalarFromX(gamma);
+            const r = gamma.xScalar();
             if (r.isZero()) return error.ZeroR;
             var s = E.Scalar.zero;
             for (partials) |p| s = s.add(p);
@@ -675,33 +687,12 @@ pub fn Ecdsa(comptime P: type, comptime E: type) type {
         }
 
         fn normalizeS(s: E.Scalar) E.Scalar {
-            const half = comptime blk: {
-                var h = E.order_be;
-                var carry: u8 = 0;
-                for (&h) |*b| {
-                    const next: u8 = b.* & 1;
-                    b.* = (carry << 7) | (b.* >> 1);
-                    carry = next;
-                }
-                break :blk h;
-            };
-            const be = s.toBytes();
-            if (std.mem.order(u8, &be, &half) == .gt) return s.neg();
-            return s;
+            return if (s.isHigh()) s.neg() else s;
         }
 
         /// Standard ECDSA verification.
         pub fn verify(pk: E.Point, msg_scalar: E.Scalar, sig: Signature) bool {
-            if (sig.r.isZero() or sig.s.isZero()) return false;
-            const s_inv = sig.s.invert();
-            const ua = msg_scalar.mul(s_inv);
-            const ub = sig.r.mul(s_inv);
-            const rp = blk: {
-                if (ua.isZero()) break :blk common.pointMulPub(E, pk, ub);
-                break :blk E.Point.mulDoubleBasePublic(E.Point.generator, ua, pk, ub) catch return false;
-            };
-            if (rp.isIdentity()) return false;
-            return scalarFromX(rp).eql(sig.r);
+            return verifySignature(E, pk, msg_scalar, sig.r, sig.s);
         }
     };
 }
