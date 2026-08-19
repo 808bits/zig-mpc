@@ -74,35 +74,46 @@ pub fn DLog(comptime E: type) type {
         commitments: [fischlin.r]E.Point,
         proofs: [fischlin.r]Interactive(E),
 
-        /// Bytes hashed for slot `i`: the generator, every commitment, the slot
-        /// index, the challenge, and the response.
+        /// The generator's encoding never changes; computing it per call costs
+        /// a field inversion on the std backend, and the proof of work calls
+        /// into this path ~10^4 times.
+        const generator_bytes = blk: {
+            @setEvalBranchQuota(100_000);
+            break :blk E.Point.generator.toBytes();
+        };
+
+        /// Midstate over everything the slot hash shares across attempts and
+        /// slots: the tag, the session id, and the (large) commitment block.
+        /// Each attempt then hashes only its ~40-byte suffix. The stream is
+        /// byte-identical to the one-shot `taggedHash`, which the
+        /// cross-implementation vectors pin down.
+        fn slotHashBase(session_id: []const u8, commitments_bytes: []const u8) hash.Stream {
+            const pn = E.Point.encoded_length;
+            const sn = E.Scalar.encoded_length;
+            const total = pn + fischlin.r * pn + 2 + fischlin.challenge_bytes + sn;
+            var st = hash.Stream.init(hash.tag.dlog_fischlin);
+            st.component(session_id);
+            st.beginComponent(total);
+            st.raw(&generator_bytes);
+            st.raw(commitments_bytes);
+            return st;
+        }
+
+        /// Bytes hashed for slot `i`: the shared prefix, then the slot index,
+        /// the challenge, and the response.
         fn slotHash(
-            session_id: []const u8,
-            commitments_bytes: []const u8,
+            base: *const hash.Stream,
             i: u16,
             challenge: [fischlin.challenge_bytes]u8,
             response: E.Scalar,
         ) hash.Digest {
             var i_be: [2]u8 = undefined;
             std.mem.writeInt(u16, &i_be, i, .big);
-            const g = E.Point.generator.toBytes();
-            const resp = response.toBytes();
-
-            // The reference concatenates all of this into a single hash
-            // component, so matching it keeps the oracle byte-identical. Every
-            // length is known at comptime, and this runs on the order of 10^4
-            // times per proof, so it stays on the stack.
-            const pn = E.Point.encoded_length;
-            const sn = E.Scalar.encoded_length;
-            const total = pn + fischlin.r * pn + 2 + fischlin.challenge_bytes + sn;
-            var msg: [total]u8 = undefined;
-            var at: usize = 0;
-            inline for (.{ &g, commitments_bytes, &i_be, &challenge, &resp }) |part| {
-                @memcpy(msg[at..][0..part.len], part);
-                at += part.len;
-            }
-            std.debug.assert(at == total);
-            return hash.taggedHash(hash.tag.dlog_fischlin, &.{ session_id, &msg });
+            var st = base.fork();
+            st.raw(&i_be);
+            st.raw(&challenge);
+            st.raw(&response.toBytes());
+            return st.digest();
         }
 
         fn commitmentsBytes(commitments: [fischlin.r]E.Point, out: []u8) void {
@@ -124,6 +135,7 @@ pub fn DLog(comptime E: type) type {
 
             var cb: [fischlin.r * E.Point.encoded_length]u8 = undefined;
             commitmentsBytes(commitments, &cb);
+            const base = slotHashBase(session_id, &cb);
 
             var proofs: [fischlin.r]Interactive(E) = undefined;
             const half = fischlin.r / 2;
@@ -134,14 +146,14 @@ pub fn DLog(comptime E: type) type {
                     var first_challenge: [fischlin.challenge_bytes]u8 = undefined;
                     rng.bytes(&first_challenge);
                     const first_response = respond(secret, states[i], first_challenge);
-                    const first = slotHash(session_id, &cb, @intCast(i), first_challenge, first_response);
+                    const first = slotHash(&base, @intCast(i), first_challenge, first_response);
 
                     var inner: usize = 0;
                     while (inner < fischlin.max_attempts) : (inner += 1) {
                         var second_challenge: [fischlin.challenge_bytes]u8 = undefined;
                         rng.bytes(&second_challenge);
                         const second_response = respond(secret, states[i + half], second_challenge);
-                        const second = slotHash(session_id, &cb, @intCast(i + half), second_challenge, second_response);
+                        const second = slotHash(&base, @intCast(i + half), second_challenge, second_response);
 
                         if (std.mem.eql(u8, first[0..fischlin.collision_bytes], second[0..fischlin.collision_bytes])) {
                             proofs[i] = .{ .challenge = first_challenge, .response = first_response };
@@ -176,11 +188,12 @@ pub fn DLog(comptime E: type) type {
 
             var cb: [fischlin.r * E.Point.encoded_length]u8 = undefined;
             commitmentsBytes(self.commitments, &cb);
+            const base = slotHashBase(session_id, &cb);
 
             const half = fischlin.r / 2;
             for (0..half) |i| {
-                const a = slotHash(session_id, &cb, @intCast(i), self.proofs[i].challenge, self.proofs[i].response);
-                const b = slotHash(session_id, &cb, @intCast(i + half), self.proofs[i + half].challenge, self.proofs[i + half].response);
+                const a = slotHash(&base, @intCast(i), self.proofs[i].challenge, self.proofs[i].response);
+                const b = slotHash(&base, @intCast(i + half), self.proofs[i + half].challenge, self.proofs[i + half].response);
                 if (!std.crypto.timing_safe.eql([fischlin.collision_bytes]u8, a[0..fischlin.collision_bytes].*, b[0..fischlin.collision_bytes].*)) return false;
                 if (!self.verifySlot(i)) return false;
                 if (!self.verifySlot(i + half)) return false;
@@ -236,11 +249,20 @@ pub fn Enc(comptime E: type) type {
             return if (branch == 0) self.v else self.v.sub(self.base_h);
         }
 
+        const enc_generator_bytes = blk: {
+            @setEvalBranchQuota(100_000);
+            break :blk E.Point.generator.toBytes();
+        };
+
         fn challengeOf(session_id: []const u8, base_h: E.Point, u: E.Point, v: E.Point, rc0: Commitments(E), rc1: Commitments(E)) E.Scalar {
             const n = E.Point.encoded_length;
             var msg: [8 * n]u8 = undefined;
-            const parts = [_]E.Point{ E.Point.generator, base_h, u, v, rc0.g, rc0.h, rc1.g, rc1.h };
-            for (parts, 0..) |p, i| @memcpy(msg[i * n ..][0..n], &p.toBytes());
+            @memcpy(msg[0..n], &enc_generator_bytes);
+            // One shared inversion for all seven serializations; on the pure
+            // Zig backends each toBytes would otherwise invert on its own.
+            var encoded: [7][n]u8 = undefined;
+            E.Point.toBytesBatch(7, .{ base_h, u, v, rc0.g, rc0.h, rc1.g, rc1.h }, &encoded);
+            for (encoded, 1..) |e, i| @memcpy(msg[i * n ..][0..n], &e);
             return hash.taggedHashScalar(E, hash.tag.enc_proof_fs, &.{ session_id, &msg });
         }
 

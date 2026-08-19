@@ -66,6 +66,50 @@ pub fn reduceToScalar(comptime E: type, bytes: Digest) E.Scalar {
     return E.Scalar.fromWideBytes(wide);
 }
 
+/// Streaming form of `taggedHash`, producing the identical byte stream, for
+/// callers that hash a large fixed prefix under many small suffixes. The
+/// Fischlin proof of work is the motivating case: ~8,000 attempts per proof,
+/// each differing only in the last ~40 bytes of a 2 KB message. Feed the
+/// fixed part once, then `fork` per attempt - a struct copy of the midstate -
+/// instead of rehashing the prefix.
+pub const Stream = struct {
+    h: Sha256,
+
+    pub fn init(t: []const u8) Stream {
+        var st = Stream{ .h = Sha256.init(.{}) };
+        st.component(t);
+        return st;
+    }
+
+    /// One complete length-prefixed component.
+    pub fn component(self: *Stream, bytes: []const u8) void {
+        appendLenPrefixed(&self.h, bytes);
+    }
+
+    /// Open a component whose `total` bytes will arrive via `raw` calls.
+    /// The caller must supply exactly `total` bytes before finishing.
+    pub fn beginComponent(self: *Stream, total: usize) void {
+        var len_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &len_buf, total, .big);
+        self.h.update(&len_buf);
+    }
+
+    pub fn raw(self: *Stream, bytes: []const u8) void {
+        self.h.update(bytes);
+    }
+
+    /// A copy of the midstate, so the suffix can be hashed many times.
+    pub fn fork(self: Stream) Stream {
+        return self;
+    }
+
+    pub fn digest(self: *Stream) Digest {
+        var out: Digest = undefined;
+        self.h.final(&out);
+        return out;
+    }
+};
+
 /// Length-delimited tagged hash, reduced into a scalar.
 pub fn taggedHashScalar(comptime E: type, t: []const u8, components: []const []const u8) E.Scalar {
     return reduceToScalar(E, taggedHash(t, components));
@@ -252,4 +296,24 @@ test "OTE randomize step matches dkls23-core" {
     const iter_be = [_]u8{vectors.randomize_iteration};
     const got = taggedHashScalar(K1, tag.ote_randomize, &.{ sid, &j_be, &iter_be, row });
     try testing.expectEqualSlices(u8, expected, &got.toBytes());
+}
+
+test "Stream reproduces taggedHash byte for byte" {
+    // The Fischlin optimization rests entirely on this equivalence.
+    const parts = [_][]const u8{ "session", "a longer static prefix", "tail" };
+    const flat = "a longer static prefixtail";
+    const direct = taggedHash(tag.dlog_fischlin, &.{ parts[0], flat });
+
+    var st = Stream.init(tag.dlog_fischlin);
+    st.component(parts[0]);
+    st.beginComponent(flat.len);
+    st.raw(parts[1]);
+    var forked = st.fork();
+    forked.raw(parts[2]);
+    try testing.expectEqual(direct, forked.digest());
+
+    // The midstate is reusable: a second fork gives the same digest again.
+    var forked2 = st.fork();
+    forked2.raw(parts[2]);
+    try testing.expectEqual(direct, forked2.digest());
 }

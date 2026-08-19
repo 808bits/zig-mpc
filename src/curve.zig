@@ -189,6 +189,38 @@ fn WeierstrassCurveImpl(comptime C: type, comptime curve_name: []const u8, compt
                 return .{ .p = try C.mulDoubleBasePublic(p1.p, s1.b, p2.p, s2.b, .big) };
             }
 
+            /// Serialize many points with one shared field inversion
+            /// (Montgomery's trick), instead of one inversion each. Public
+            /// points only - the batching is not constant time across the
+            /// set. Falls back to per-point serialization if any input is
+            /// the identity, which no caller feeds it in practice.
+            pub fn toBytesBatch(comptime n: usize, points: [n]Point, out: *[n][encoded_length]u8) void {
+                for (points) |q| {
+                    if (q.isIdentity()) {
+                        for (points, 0..) |r, i| out[i] = r.toBytes();
+                        return;
+                    }
+                }
+                var prefix: [n]C.Fe = undefined;
+                var acc = C.Fe.one;
+                for (points, 0..) |q, i| {
+                    prefix[i] = acc;
+                    acc = acc.mul(q.p.z);
+                }
+                var inv_acc = acc.invert();
+                var i: usize = n;
+                while (i > 0) {
+                    i -= 1;
+                    const z_inv = inv_acc.mul(prefix[i]);
+                    inv_acc = inv_acc.mul(points[i].p.z);
+                    // Projective (x/z, y/z); compressed SEC1 by y parity.
+                    const ax = points[i].p.x.mul(z_inv);
+                    const ay = points[i].p.y.mul(z_inv);
+                    out[i][0] = if (ay.isOdd()) 0x03 else 0x02;
+                    out[i][1..].* = ax.toBytes(.big);
+                }
+            }
+
             pub fn eql(a: Point, b: Point) bool {
                 return a.p.equivalent(b.p);
             }
@@ -492,4 +524,20 @@ test {
         _ = @import("curve_libsecp.zig");
     }
     _ = @import("glv.zig");
+}
+
+test "batch serialization matches per-point serialization" {
+    var prng = std.Random.DefaultCsprng.init(@splat(0x71));
+    const rng = prng.random();
+    const E = Secp256k1Std;
+    var pts: [7]E.Point = undefined;
+    for (&pts) |*p| p.* = try E.Point.mulBase(E.Scalar.random(rng));
+    var batch: [7][33]u8 = undefined;
+    E.Point.toBytesBatch(7, pts, &batch);
+    for (pts, batch) |p, b| try std.testing.expectEqualSlices(u8, &p.toBytes(), &b);
+
+    // Identity anywhere falls back and still agrees.
+    pts[3] = E.Point.identity;
+    E.Point.toBytesBatch(7, pts, &batch);
+    for (pts, batch) |p, b| try std.testing.expectEqualSlices(u8, &p.toBytes(), &b);
 }

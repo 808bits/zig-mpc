@@ -224,6 +224,12 @@ pub const Secp256k1 = struct {
             return sum;
         }
 
+        /// Batch serialization, for signature parity with the std backend.
+        /// Points here already carry their encoding, so this is a copy.
+        pub fn toBytesBatch(comptime n: usize, points: [n]Point, out: *[n][encoded_length]u8) void {
+            for (points, 0..) |p, i| out[i] = p.toBytes();
+        }
+
         pub fn eql(a: Point, b: Point) bool {
             if (a.inf or b.inf) return a.inf and b.inf;
             return std.mem.eql(u8, &a.sec1, &b.sec1);

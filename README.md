@@ -15,10 +15,10 @@ oblivious transfer and needs no RSA modulus at all.
 
 secp256k1 point arithmetic has three interchangeable backends behind one
 comptime interface, selected with `-Dsecp=std|glv|libsecp`:
-bitcoin-core/libsecp256k1 (the default; ~5x faster DKLs23 setup),
+bitcoin-core/libsecp256k1 (the default; ~3x faster DKLs23 setup),
 std.crypto as shipped, and `glv` - std.crypto with proper GLV endomorphism
-multiplication added in `src/glv.zig` (~1.2-1.5x over plain std, pure Zig,
-and what the wasm build uses since it cannot link C). All three produce
+multiplication and a fixed-base comb added in `src/glv.zig` (~1.5x over
+plain std, pure Zig, and what the wasm build uses since it cannot link C). All three produce
 identical bytes for every operation - the equivalence is tested op by op -
 so key shares, frames and signatures interoperate across backends, and
 switching is only ever a build flag. `zig build bench -Dsecp=...` measures

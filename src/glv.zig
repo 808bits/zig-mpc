@@ -28,6 +28,9 @@ const NonCanonicalError = std.crypto.errors.NonCanonicalError;
 const C = std.crypto.ecc.Secp256k1;
 const Fe = C.Fe;
 const scalar = C.scalar;
+/// The affine point type is declared at file scope in std rather than inside
+/// the curve struct, so recover it from the API that returns it.
+const Affine = @typeInfo(@TypeOf(C.affineCoordinates)).@"fn".return_type.?;
 
 /// beta: a primitive cube root of unity in the field. phi(x,y) = (beta*x, y).
 const beta = Fe.fromInt(0x7ae96a2b657c07106e64479eac3434e99cf0497512f58995c1396c28719501ee) catch unreachable;
@@ -62,16 +65,95 @@ fn precompute(p: C, comptime count: usize) [1 + count]C {
     return pc;
 }
 
-/// Comptime tables for the base point and its endomorphism image, so base
-/// multiplications never pay the per-call precompute.
-const base_pc: [16]C = pc: {
+/// Comptime table for the base point in the shared-ladder vartime paths
+/// (the constant-time and pure-base paths use the comb below instead).
+const base_pc: [9]C = pc: {
     @setEvalBranchQuota(100_000);
-    break :pc precompute(C.basePoint, 15);
+    break :pc precompute(C.basePoint, 8);
 };
-const base_endo_pc: [16]C = pc: {
-    @setEvalBranchQuota(100_000);
-    break :pc precompute(endo(C.basePoint), 15);
+
+/// Fixed-base comb: affine tables comb_g[i][d-1] = d * 16^i * G for
+/// d in 1..8 and window position i in 0..32. A base multiplication becomes
+/// pure table additions - zero doublings - because each window's weight
+/// 16^i is baked into its table. Signed window digits (-8..8) keep the
+/// tables at 8 entries, and the second GLV half needs no table of its own:
+/// phi is a homomorphism, so phi(d*16^i*G) is one field multiplication away
+/// from the stored entry.
+///
+/// Entries are affine so the additions use the cheaper complete `addMixed`
+/// (9 field muls vs 12); the batch inversion that normalizes them runs once,
+/// at comptime.
+const comb_windows = 33; // 32 nibbles of a 128-bit half, plus the recoding carry
+const comb_g: [comb_windows][8]Affine = pc: {
+    @setEvalBranchQuota(4_000_000);
+    var proj: [comb_windows][8]C = undefined;
+    var base_i = C.basePoint; // 16^i * G
+    for (0..comb_windows) |i| {
+        proj[i][0] = base_i;
+        for (1..8) |d| proj[i][d] = proj[i][d - 1].add(base_i);
+        if (i + 1 < comb_windows) base_i = base_i.dbl().dbl().dbl().dbl();
+    }
+    // Montgomery batch inversion of every z: one inversion for all 264
+    // entries, which is what makes affine tables affordable at comptime.
+    var prefix: [comb_windows * 8]Fe = undefined;
+    var acc = Fe.one;
+    for (0..comb_windows * 8) |k| {
+        prefix[k] = acc;
+        acc = acc.mul(proj[k / 8][k % 8].z);
+    }
+    var inv_acc = acc.invert();
+    var affine: [comb_windows][8]Affine = undefined;
+    var k: usize = comb_windows * 8;
+    while (k > 0) {
+        k -= 1;
+        const pt = proj[k / 8][k % 8];
+        const z_inv = inv_acc.mul(prefix[k]);
+        inv_acc = inv_acc.mul(pt.z);
+        // std's points are homogeneous projective (RCB complete formulas):
+        // affine is (x/z, y/z), not the Jacobian (x/z^2, y/z^3).
+        affine[k / 8][k % 8] = .{ .x = pt.x.mul(z_inv), .y = pt.y.mul(z_inv) };
+    }
+    break :pc affine;
 };
+
+fn affineCMov(p: *Affine, a: Affine, c: u1) void {
+    p.x.cMov(a.x, c);
+    p.y.cMov(a.y, c);
+}
+
+/// Constant-time signed lookup in window `i`: digit in -8..8, `half_neg` the
+/// half-scalar's factored-out sign, `apply_endo` mapping the entry through
+/// phi for the lambda half. Digit 0 yields the affine identity, which
+/// `addMixed` treats as a no-op.
+fn combSelect(i: usize, digit: i8, half_neg: u1, comptime apply_endo: bool) Affine {
+    const spread: i8 = digit >> 7;
+    const mag: u8 = @bitCast((digit ^ spread) -% spread);
+    const digit_neg: u1 = @intCast(@as(u8, @bitCast(spread)) & 1);
+
+    var t = Affine.identityElement;
+    comptime var d: u8 = 1;
+    inline while (d <= 8) : (d += 1) {
+        affineCMov(&t, comb_g[i][d - 1], @as(u1, @truncate((@as(usize, mag ^ d) -% 1) >> 8)));
+    }
+    if (apply_endo) t.x = t.x.mul(beta);
+    const y_neg = t.y.neg();
+    t.y.cMov(y_neg, digit_neg ^ half_neg);
+    return t;
+}
+
+/// Constant-time base multiplication: 66 mixed additions, no doublings.
+fn mulBaseComb(s: [32]u8) IdentityElementError!C {
+    const halves = splitNormalize(s) catch unreachable; // canonical by contract
+    const e1 = slide(halves[0].mag);
+    const e2 = slide(halves[1].mag);
+    var q = C.identityElement;
+    for (0..comb_windows) |i| {
+        q = q.addMixed(combSelect(i, e1[i], halves[0].neg, false));
+        q = q.addMixed(combSelect(i, e2[i], halves[1].neg, true));
+    }
+    try q.rejectIdentity();
+    return q;
+}
 
 /// Signed 4-bit windows (as in std). For half-width scalars only entries
 /// 0..32 can be nonzero.
@@ -162,16 +244,17 @@ fn normalize(r: [32]u8) Half {
 /// `s` must be canonical (the callers' Scalar type guarantees it).
 pub fn mul(p: C, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!C {
     const s = if (endian == .little) s_ else Fe.orderSwap(s_);
-    if (!p.is_base) try p.rejectIdentity();
+    if (p.is_base) return mulBaseComb(s);
+    try p.rejectIdentity();
 
     const halves = splitNormalize(s) catch unreachable; // canonical by contract
     var pc1_array: [16]C = undefined;
     var pc2_array: [16]C = undefined;
-    const pc1 = if (p.is_base) &base_pc else pc: {
+    const pc1 = pc: {
         pc1_array = precompute(p, 15);
         break :pc &pc1_array;
     };
-    const pc2 = if (p.is_base) &base_endo_pc else pc: {
+    const pc2 = pc: {
         pc2_array = precompute(endo(p), 15);
         break :pc &pc2_array;
     };
@@ -197,6 +280,8 @@ pub fn mulPublic(p: C, s_: [32]u8, endian: std.builtin.Endian) (IdentityElementE
     const s = if (endian == .little) s_ else Fe.orderSwap(s_);
     const zero = comptime scalar.Scalar.zero.toBytes(.little);
     if (mem.eql(u8, &zero, &s)) return error.IdentityElement;
+    // The comb beats the sliding-window ladder even without skipping zeros.
+    if (p.is_base) return mulBaseComb(s);
 
     const halves = try splitNormalize(s);
     const p1 = if (halves[0].neg == 1) p.neg() else p;
