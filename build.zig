@@ -164,6 +164,22 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run the DKLs23 benchmark");
     bench_step.dependOn(&b.addRunArtifact(bench_exe).step);
 
+    // Cross-scheme benchmark: FROST on three curves + CGGMP24 ecdsa_fast.
+    const fam_exe = b.addExecutable(.{
+        .name = "bench-families",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/families.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "zig_mpc", .module = bench_mpc_mod },
+                .{ .name = "secp_backend", .module = secp_backend_mod },
+            },
+        }),
+    });
+    const fam_step = b.step("bench-families", "Run the cross-scheme benchmark");
+    fam_step.dependOn(&b.addRunArtifact(fam_exe).step);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_dkls_tests.step);
